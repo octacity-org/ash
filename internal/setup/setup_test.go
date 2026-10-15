@@ -106,6 +106,84 @@ func TestCodexSetupUpdatesExistingEntry(t *testing.T) {
 	}
 }
 
+// Updating the ASH table replaces only command and args; keys and comments the
+// user added to that table, such as Codex approval settings, survive.
+func TestCodexSetupKeepsOtherKeysInAshTable(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	t.Setenv("CODEX_HOME", "")
+	path := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := "[mcp_servers.ash]\n" +
+		"command = \"old\"\n" +
+		"args = [\n  \"mcp\",\n]\n" +
+		"# approve every tool\n" +
+		"default_tools_approval_mode = \"approve\"\n\n" +
+		"[mcp_servers.ash.tools.ash_exec]\n" +
+		"approval_mode = \"approve\"\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts := baseOpts(t, "codex", UserScope, "")
+	result, err := Run(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		MCPServers map[string]map[string]any `toml:"mcp_servers"`
+	}
+	if err := toml.Unmarshal([]byte(result.Content), &doc); err != nil {
+		t.Fatalf("%v in:\n%s", err, result.Content)
+	}
+	ash := doc.MCPServers["ash"]
+	if ash["command"] != opts.AshPath || ash["default_tools_approval_mode"] != "approve" {
+		t.Fatalf("bad ASH table %v in:\n%s", ash, result.Content)
+	}
+	if args, _ := ash["args"].([]any); len(args) != 3 || args[2] != "mcp" {
+		t.Fatalf("bad args %v in:\n%s", ash["args"], result.Content)
+	}
+	for _, want := range []string{"# approve every tool", "[mcp_servers.ash.tools.ash_exec]\napproval_mode = \"approve\""} {
+		if !strings.Contains(result.Content, want) {
+			t.Fatalf("missing %q in:\n%s", want, result.Content)
+		}
+	}
+	second, err := Run(baseOpts(t, "codex", UserScope, ""))
+	if err != nil || second.Written || second.Content != result.Content {
+		t.Fatalf("not idempotent: %+v %v", second, err)
+	}
+}
+
+func TestOpenCodeSetupKeepsOtherKeysInAshEntry(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	path := filepath.Join(home, ".config", "opencode", "opencode.json")
+	original := `{"mcp":{"ash":{"type":"local","command":["old"],"timeout":5000,"environment":{"A":"1"}}}}`
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts := baseOpts(t, "opencode", UserScope, "")
+	result, err := Run(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		MCP map[string]map[string]any `json:"mcp"`
+	}
+	if err := json.Unmarshal([]byte(result.Content), &doc); err != nil {
+		t.Fatal(err)
+	}
+	ash := doc.MCP["ash"]
+	command, _ := ash["command"].([]any)
+	if len(command) == 0 || command[0] != opts.AshPath || ash["timeout"] != float64(5000) || ash["environment"] == nil {
+		t.Fatalf("bad ASH entry in:\n%s", result.Content)
+	}
+}
+
 func TestOpenCodeSetupPreservesOtherKeys(t *testing.T) {
 	home := t.TempDir()
 	setHome(t, home)

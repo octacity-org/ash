@@ -298,10 +298,10 @@ func tomlHasAshServer(existing []byte) (bool, error) {
 	return ok, nil
 }
 
-// upsertTOMLSection replaces the existing ASH table - whatever valid header
-// spelling it uses - with the canonical section, or appends it. Only the
-// lines of that table are replaced, so unrelated bytes, comments, ordering,
-// and formatting survive untouched.
+// upsertTOMLSection replaces the existing ASH table header - whatever valid
+// spelling it uses - and the keys the canonical section sets, or appends the
+// section. Other keys and comments in that table, and every byte outside it,
+// survive untouched.
 func upsertTOMLSection(doc, header, section string, present bool) (string, error) {
 	doc = strings.TrimRight(doc, "\n")
 	lines := strings.Split(doc, "\n")
@@ -312,9 +312,17 @@ func upsertTOMLSection(doc, header, section string, present bool) (string, error
 	}
 	start, end := findTOMLTable(lines, key...)
 	if start != -1 {
-		out := make([]string, 0, len(lines)-(end-start)+len(sectionLines))
+		owned := map[string]bool{}
+		for _, line := range sectionLines[1:] {
+			if k, ok := assignmentKey(line); ok {
+				owned[strings.Join(k, ".")] = true
+			}
+		}
+		kept := withoutKeys(lines[start+1:end], owned)
+		out := make([]string, 0, start+len(sectionLines)+len(kept)+len(lines)-end)
 		out = append(out, lines[:start]...)
 		out = append(out, sectionLines...)
+		out = append(out, kept...)
 		out = append(out, lines[end:]...)
 		return strings.Join(out, "\n") + "\n", nil
 	}
@@ -333,9 +341,43 @@ func upsertTOMLSection(doc, header, section string, present bool) (string, error
 	return strings.Join(out, "\n") + "\n", nil
 }
 
-// rewriteTOMLSectionInPlace was removed: upsertTOMLSection splices the
-// canonical section over exactly the existing table's lines, whatever valid
-// header spelling it uses, so nothing is ever re-marshalled.
+// withoutKeys drops the key/value lines of a table body whose dotted key is
+// owned, including continuation lines of multi-line arrays and strings.
+func withoutKeys(body []string, owned map[string]bool) []string {
+	state := &tomlLineState{}
+	kept := make([]string, 0, len(body))
+	skipping := false
+	for _, line := range body {
+		if state.depth == 0 && state.multiline == 0 {
+			key, ok := assignmentKey(line)
+			skipping = ok && owned[strings.Join(key, ".")]
+		}
+		state.consume(line)
+		if !skipping {
+			kept = append(kept, line)
+		}
+	}
+	return kept
+}
+
+// assignmentKey parses the dotted key of a `key = value` line.
+func assignmentKey(line string) ([]string, bool) {
+	s := strings.TrimLeft(line, " \t")
+	var parts []string
+	for {
+		part, rest, err := parseTOMLKeyPart(s)
+		if err != nil {
+			return nil, false
+		}
+		parts = append(parts, part)
+		s = strings.TrimLeft(rest, " \t")
+		if !strings.HasPrefix(s, ".") {
+			break
+		}
+		s = strings.TrimLeft(s[1:], " \t")
+	}
+	return parts, strings.HasPrefix(s, "=")
+}
 
 // findTOMLTable locates the [start, end) line range of the single table
 // definition whose dotted key equals want. Lines inside multi-line strings or
@@ -563,8 +605,9 @@ func renderFreebuff(existing []byte, command []string) ([]byte, error) {
 	return upsertJSONEntry(existing, "mcpServers", "ash", entry, "")
 }
 
-// upsertJSONEntry sets root[container][name] = entry while preserving every
-// other key. Invalid JSON is reported rather than overwritten.
+// upsertJSONEntry sets entry's keys on root[container][name] while preserving
+// every other key, including other keys of an existing entry. Invalid JSON is
+// reported rather than overwritten.
 func upsertJSONEntry(existing []byte, container, name string, entry map[string]any, schema string) ([]byte, error) {
 	root := map[string]any{}
 	if trimmed := strings.TrimSpace(string(existing)); trimmed != "" {
@@ -578,6 +621,12 @@ func upsertJSONEntry(existing []byte, container, name string, entry map[string]a
 	}
 	if servers == nil {
 		servers = map[string]any{}
+	}
+	if current, ok := servers[name].(map[string]any); ok {
+		for k, v := range entry {
+			current[k] = v
+		}
+		entry = current
 	}
 	servers[name] = entry
 	root[container] = servers
