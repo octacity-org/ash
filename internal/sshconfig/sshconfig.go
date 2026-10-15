@@ -30,6 +30,9 @@ type Effective struct {
 	Identities   []string
 	AgentSocket  string
 	HostKeyAlias string
+	// KnownHostsFiles are UserKnownHostsFile candidates, in order. ssh -G
+	// separates them with spaces, so paths containing spaces are unsupported.
+	KnownHostsFiles []string
 }
 
 // Runner runs a command without a shell. It is a seam for tests.
@@ -115,6 +118,14 @@ func parse(out string) (Effective, []string, error) {
 			if value != "" {
 				effective.HostKeyAlias = value
 			}
+		case "userknownhostsfile":
+			if normalize(value) == "none" {
+				// OpenSSH would then rely on global known_hosts files only,
+				// which ASH does not read.
+				unsupported = append(unsupported, "UserKnownHostsFile none")
+			} else {
+				effective.KnownHostsFiles = strings.Fields(value)
+			}
 		case "proxyjump":
 			if v := normalize(value); v != "" && v != "none" {
 				unsupported = append(unsupported, "ProxyJump")
@@ -160,6 +171,7 @@ func (e Effective) Apply(h host.Host) host.Host {
 	}
 	h.AgentSocket = e.AgentSocket
 	h.HostKeyAlias = e.HostKeyAlias
+	h.KnownHostsFiles = append([]string(nil), e.KnownHostsFiles...)
 	if h.Port == 0 {
 		h.Port = 22
 	}

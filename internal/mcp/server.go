@@ -44,6 +44,8 @@ type readInput struct {
 	Host     string `json:"host"`
 	Path     string `json:"path"`
 	Encoding string `json:"encoding,omitempty" jsonschema:"Optional. \"text\" (default) returns UTF-8 content; \"base64\" returns base64 for binary files."`
+	Offset   int64  `json:"offset,omitempty" jsonschema:"Optional byte offset to start reading at. Negative values count back from the end of the file, for example -65536 to tail a log."`
+	Limit    int64  `json:"limit,omitempty" jsonschema:"Optional maximum bytes to read, at most 4194304. Setting offset or limit reads a slice, which works on files of any size."`
 }
 type writeInput struct {
 	Host          string  `json:"host"`
@@ -55,6 +57,9 @@ type readOutput struct {
 	Content       string `json:"content,omitempty"`
 	ContentBase64 string `json:"content_base64,omitempty"`
 	Size          int    `json:"size"`
+	// Offset and FileSize are set for slice reads so the caller can page.
+	Offset   *int64 `json:"offset,omitempty"`
+	FileSize *int64 `json:"file_size,omitempty"`
 }
 type writeOutput struct {
 	Size int `json:"size"`
@@ -129,7 +134,7 @@ func execStdin(in execInput) ([]byte, bool, error) {
 
 func New(s *service.Service, shells *service.ShellService) *sdk.Server {
 	server := sdk.NewServer(&sdk.Implementation{Name: "ash", Version: Version}, nil)
-	sdk.AddTool(server, &sdk.Tool{Name: "ash_hosts", Description: "List configured hosts and granted capabilities."}, func(ctx context.Context, _ *sdk.CallToolRequest, _ struct{}) (*sdk.CallToolResult, hostsResult, error) {
+	sdk.AddTool(server, &sdk.Tool{Name: "ash_hosts", Description: "List configured hosts, granted capabilities, and policy limits (path roots, allowed commands, bounds, shell backend)."}, func(ctx context.Context, _ *sdk.CallToolRequest, _ struct{}) (*sdk.CallToolResult, hostsResult, error) {
 		return nil, hostsResult{Hosts: s.Hosts()}, nil
 	})
 	sdk.AddTool(server, &sdk.Tool{Name: "ash_exec", Description: "Execute shell code on a configured host. Non-zero process exits are results, not tool errors."}, func(ctx context.Context, _ *sdk.CallToolRequest, in execInput) (*sdk.CallToolResult, execOutput, error) {
@@ -144,24 +149,41 @@ func New(s *service.Service, shells *service.ShellService) *sdk.Server {
 		r, err := s.Exec(ctx, transport.ExecRequest{Host: in.Host, Command: in.Command, Argv: in.Argv, Cwd: in.Cwd, Env: in.Env, Timeout: timeout, Stdin: stdin, StdinSet: stdinSet})
 		return nil, execOutput{ExitCode: r.ExitCode, Stdout: r.Stdout, Stderr: r.Stderr, StdoutTruncated: r.StdoutTruncated, StderrTruncated: r.StderrTruncated, DurationMS: r.Duration.Milliseconds()}, err
 	})
-	sdk.AddTool(server, &sdk.Tool{Name: "ash_read", Description: "Read up to 4 MiB using SFTP. Returns UTF-8 content by default, or base64 when encoding is \"base64\"."}, func(ctx context.Context, _ *sdk.CallToolRequest, in readInput) (*sdk.CallToolResult, readOutput, error) {
-		data, err := s.Read(ctx, in.Host, in.Path)
-		if err != nil {
-			return nil, readOutput{}, err
+	sdk.AddTool(server, &sdk.Tool{Name: "ash_read", Description: "Read a file using SFTP: the whole file up to 4 MiB, or a slice of any file with offset/limit (negative offset tails). Returns UTF-8 content by default, or base64 when encoding is \"base64\". Text slices drop partial characters at their edges; offset reports where the content starts."}, func(ctx context.Context, _ *sdk.CallToolRequest, in readInput) (*sdk.CallToolResult, readOutput, error) {
+		if in.Encoding != "" && in.Encoding != "text" && in.Encoding != "base64" {
+			return nil, readOutput{}, fmt.Errorf("encoding must be \"text\" or \"base64\"")
 		}
-		out := readOutput{Size: len(data)}
-		switch in.Encoding {
-		case "", "text":
+		if in.Offset == 0 && in.Limit == 0 {
+			data, err := s.Read(ctx, in.Host, in.Path)
+			if err != nil {
+				return nil, readOutput{}, err
+			}
+			out := readOutput{Size: len(data)}
+			if in.Encoding == "base64" {
+				out.ContentBase64 = base64.StdEncoding.EncodeToString(data)
+				return nil, out, nil
+			}
 			content, err := service.Text(data)
 			if err != nil {
 				return nil, readOutput{}, err
 			}
 			out.Content = content
-		case "base64":
-			out.ContentBase64 = base64.StdEncoding.EncodeToString(data)
-		default:
-			return nil, readOutput{}, fmt.Errorf("encoding must be \"text\" or \"base64\"")
+			return nil, out, nil
 		}
+		r, err := s.ReadRange(ctx, in.Host, in.Path, in.Offset, in.Limit)
+		if err != nil {
+			return nil, readOutput{}, err
+		}
+		out := readOutput{Size: len(r.Data), Offset: &r.Offset, FileSize: &r.Size}
+		if in.Encoding == "base64" {
+			out.ContentBase64 = base64.StdEncoding.EncodeToString(r.Data)
+			return nil, out, nil
+		}
+		content, offset, err := service.TextRange(r)
+		if err != nil {
+			return nil, readOutput{}, err
+		}
+		out.Content, out.Size, out.Offset = content, len(content), &offset
 		return nil, out, nil
 	})
 	sdk.AddTool(server, &sdk.Tool{Name: "ash_write", Description: "Create or truncate a file through SFTP, up to 4 MiB. Parent directory must exist. Supplying content_base64 implies binary semantics."}, func(ctx context.Context, _ *sdk.CallToolRequest, in writeInput) (*sdk.CallToolResult, writeOutput, error) {

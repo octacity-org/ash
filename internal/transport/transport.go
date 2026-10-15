@@ -80,9 +80,20 @@ type TreeEntry struct {
 	Data  []byte `json:"data,omitempty"`
 }
 
+// FileRange is a bounded slice of a remote file. Offset is the absolute
+// position of Data and Size is the file's total size.
+type FileRange struct {
+	Data   []byte
+	Offset int64
+	Size   int64
+}
+
 type Transport interface {
 	Exec(context.Context, host.Host, ExecRequest) (ExecResult, error)
 	Read(context.Context, host.Host, string) ([]byte, error)
+	// ReadRange reads at most limit bytes starting at offset; a negative
+	// offset counts back from the end of the file.
+	ReadRange(ctx context.Context, h host.Host, p string, offset, limit int64) (FileRange, error)
 	Write(context.Context, host.Host, string, []byte) error
 	Stat(context.Context, host.Host, string) (FileInfo, error)
 	Canonicalize(context.Context, host.Host, string) (string, error)

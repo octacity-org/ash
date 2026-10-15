@@ -39,6 +39,9 @@ type shellListOutput struct {
 }
 type shellSendOutput struct {
 	Sent bool `json:"sent"`
+	// Cursor is captured just before delivery; waiting from it observes only
+	// output produced after the input was sent.
+	Cursor string `json:"cursor,omitempty"`
 }
 type shellCloseOutput struct {
 	Closed bool `json:"closed"`
@@ -53,9 +56,9 @@ func registerShellTools(server *sdk.Server, s *service.ShellService) {
 		shells, err := s.List(ctx, in.Host)
 		return nil, shellListOutput{Shells: shells}, err
 	})
-	sdk.AddTool(server, &sdk.Tool{Name: "ash_shell_send", Description: "Send literal UTF-8 input to a persistent shell, at most 64 KiB. Include a newline to execute it. Requires exec capability; returns after delivery, not command completion."}, func(ctx context.Context, _ *sdk.CallToolRequest, in shellSendInput) (*sdk.CallToolResult, shellSendOutput, error) {
-		err := s.Send(ctx, in.Host, in.ShellID, in.Input)
-		return nil, shellSendOutput{Sent: err == nil}, err
+	sdk.AddTool(server, &sdk.Tool{Name: "ash_shell_send", Description: "Send literal UTF-8 input to a persistent shell, at most 64 KiB. Include a newline to execute it. Requires exec capability; returns after delivery, not command completion. Returns a cursor captured just before delivery: pass it to ash_shell_wait to observe only the output this input produced."}, func(ctx context.Context, _ *sdk.CallToolRequest, in shellSendInput) (*sdk.CallToolResult, shellSendOutput, error) {
+		cursor, err := s.SendWithCursor(ctx, in.Host, in.ShellID, in.Input)
+		return nil, shellSendOutput{Sent: err == nil, Cursor: cursor}, err
 	})
 	sdk.AddTool(server, &sdk.Tool{Name: "ash_shell_read", Description: "Read shell terminal output. Without cursor, returns a bounded snapshot of output and available scrollback. With cursor, returns only output added since that read, or a full snapshot with resync=true. Includes merged stdout/stderr. Requires exec capability."}, func(ctx context.Context, _ *sdk.CallToolRequest, in shellInput) (*sdk.CallToolResult, shell.Output, error) {
 		output, err := s.Read(ctx, in.Host, in.ShellID, in.Cursor)

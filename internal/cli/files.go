@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"ash/internal/service"
@@ -20,6 +21,53 @@ func encodeOK(out io.Writer, fail func(error) int) int {
 		return fail(err)
 	}
 	return 0
+}
+
+// runRead writes a whole file, or a slice when --offset or --limit is given.
+func runRead(ctx context.Context, args []string, s *service.Service, out io.Writer) error {
+	if len(args) < 2 {
+		return fmt.Errorf("read requires HOST PATH [--offset N] [--limit N]")
+	}
+	var offset, limit int64
+	ranged := false
+	for i := 2; i < len(args); i++ {
+		key, value, hasValue := strings.Cut(args[i], "=")
+		if key != "--offset" && key != "--limit" {
+			return fmt.Errorf("unknown read option %q", args[i])
+		}
+		if !hasValue {
+			i++
+			if i == len(args) {
+				return fmt.Errorf("%s requires a value", key)
+			}
+			value = args[i]
+		}
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("%s requires an integer", key)
+		}
+		if key == "--offset" {
+			offset = n
+		} else {
+			limit = n
+		}
+		ranged = true
+	}
+	var data []byte
+	if ranged {
+		r, err := s.ReadRange(ctx, args[0], args[1], offset, limit)
+		if err != nil {
+			return err
+		}
+		data = r.Data
+	} else {
+		var err error
+		if data, err = s.Read(ctx, args[0], args[1]); err != nil {
+			return err
+		}
+	}
+	_, err := out.Write(data)
+	return err
 }
 
 func runWrite(ctx context.Context, args []string, s *service.Service, in io.Reader) error {

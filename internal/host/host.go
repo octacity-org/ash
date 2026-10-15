@@ -25,6 +25,9 @@ type Host struct {
 	Identities   []string `toml:"-"`
 	AgentSocket  string   `toml:"-"`
 	HostKeyAlias string   `toml:"-"`
+	// KnownHostsFiles are the alias's UserKnownHostsFile candidates; empty
+	// means the transport's default known_hosts file.
+	KnownHostsFiles []string `toml:"-"`
 }
 
 type Registry struct{ hosts map[string]Host }

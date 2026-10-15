@@ -37,9 +37,12 @@ type Record struct {
 	Decision   Decision  `json:"decision"`
 	Result     Result    `json:"result"`
 	DurationMS int64     `json:"duration_ms"`
-	BytesIn    int64     `json:"bytes_in,omitempty"`
-	BytesOut   int64     `json:"bytes_out,omitempty"`
-	Truncated  bool      `json:"truncated,omitempty"`
+	// BytesIn counts payload sent to the remote host (stdin, written content,
+	// shell input); BytesOut counts payload returned from it (process output,
+	// read content, shell output). Truncated reports a bounded result.
+	BytesIn   int64 `json:"bytes_in,omitempty"`
+	BytesOut  int64 `json:"bytes_out,omitempty"`
+	Truncated bool  `json:"truncated,omitempty"`
 }
 
 // Recorder appends records to one owner-only file. It is safe for concurrent

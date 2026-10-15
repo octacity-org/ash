@@ -64,8 +64,17 @@ func keyFor(h host.Host, knownHostsPath string) connKey {
 		identities:   strings.Join(h.Identities, "\x00"),
 		agent:        h.AgentSocket,
 		hostKeyAlias: h.HostKeyAlias,
-		knownHosts:   knownHostsPath,
+		knownHosts:   strings.Join(trustFiles(h, knownHostsPath), "\x00"),
 	}
+}
+
+// trustFiles returns the known_hosts candidates for a host: those OpenSSH
+// resolved for its alias, or the transport default.
+func trustFiles(h host.Host, knownHostsPath string) []string {
+	if len(h.KnownHostsFiles) > 0 {
+		return h.KnownHostsFiles
+	}
+	return []string{knownHostsPath}
 }
 
 // sshResource adapts a pooled SSH client to the pool's resource contract. It
@@ -76,6 +85,33 @@ type sshResource struct {
 	lifecycle resourceLifecycle
 	closeOnce sync.Once
 	closeErr  error
+	// sftp is the connection's SFTP session, opened on first file operation
+	// and reused while it lives; sftpDone closes when that session ends.
+	sftp     *sftp.Client
+	sftpDone chan struct{}
+}
+
+// sftpClient returns the connection's SFTP session, replacing one that has
+// ended. The pool hands a resource to one operation at a time, so the session
+// is never shared concurrently.
+func (r *sshResource) sftpClient() (*sftp.Client, error) {
+	if r.sftp != nil {
+		select {
+		case <-r.sftpDone:
+			r.sftp.Close()
+			r.sftp = nil
+		default:
+			return r.sftp, nil
+		}
+	}
+	fs, err := sftp.NewClient(r.client)
+	if err != nil {
+		return nil, err
+	}
+	done := make(chan struct{})
+	go func() { fs.Wait(); close(done) }()
+	r.sftp, r.sftpDone = fs, done
+	return fs, nil
 }
 
 // healthCheck sends one keepalive probe. The provided context always carries a
@@ -115,6 +151,9 @@ func (r *sshResource) close() error {
 	r.closeOnce.Do(func() {
 		if r.lifecycle.stop != nil {
 			r.lifecycle.stop()
+		}
+		if r.sftp != nil {
+			r.sftp.Close()
 		}
 		if r.client != nil {
 			r.closeErr = r.client.Close()
@@ -160,8 +199,24 @@ func loadIdentityFile(path string, missingOK bool) (gossh.Signer, error) {
 	return signer, nil
 }
 
-func (t *Transport) knownHosts() (gossh.HostKeyCallback, error) {
-	callback, err := knownhosts.New(t.knownHostsPath)
+func (t *Transport) knownHosts(h host.Host) (gossh.HostKeyCallback, error) {
+	// Like OpenSSH, read every candidate that exists; a missing one is
+	// skipped, but at least one trust file is required.
+	candidates := trustFiles(h, t.knownHostsPath)
+	files := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		path, err := expandHome(candidate)
+		if err != nil {
+			return nil, fmt.Errorf("%w: load known_hosts: %v", transport.ErrHostKey, err)
+		}
+		if _, err := os.Stat(path); err == nil {
+			files = append(files, path)
+		}
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("%w: load known_hosts: no file found at %s", transport.ErrHostKey, strings.Join(candidates, ", "))
+	}
+	callback, err := knownhosts.New(files...)
 	if err != nil {
 		return nil, fmt.Errorf("%w: load known_hosts: %v", transport.ErrHostKey, err)
 	}
@@ -210,9 +265,19 @@ func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, fu
 	if t.dialOverride != nil {
 		return t.dialOverride(ctx, h)
 	}
+	res, release, err := t.claim(ctx, h)
+	if err != nil {
+		return nil, nil, err
+	}
+	return res.client, release, nil
+}
+
+// claim returns a pooled or freshly dialed resource and the function that
+// returns it to the pool.
+func (t *Transport) claim(ctx context.Context, h host.Host) (*sshResource, func(), error) {
 	key := keyFor(h, t.knownHostsPath)
 	if res, ok := t.pool.get(ctx, key); ok {
-		return res.(*sshResource).client, func() { t.pool.put(key, res) }, nil
+		return res.(*sshResource), func() { t.pool.put(key, res) }, nil
 	}
 	if err := t.pool.reserve(ctx); err != nil {
 		return nil, nil, operationError(ctx, err)
@@ -222,7 +287,7 @@ func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, fu
 		t.pool.releaseSlot()
 		return nil, nil, err
 	}
-	return res.client, func() { t.pool.put(key, res) }, nil
+	return res, func() { t.pool.put(key, res) }, nil
 }
 
 // dialSSH establishes a fresh, verified connection and returns the resource
@@ -230,7 +295,7 @@ func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, fu
 // resource. Cleanup for a failed dial happens inside dialSSH; a returned
 // resource is only ever closed through the pool.
 func (t *Transport) dialSSH(ctx context.Context, h host.Host) (*sshResource, error) {
-	hostKey, err := t.knownHosts()
+	hostKey, err := t.knownHosts(h)
 	if err != nil {
 		return nil, err
 	}

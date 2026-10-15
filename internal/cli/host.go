@@ -14,7 +14,10 @@ import (
 
 const HostAddUsage = `Usage:
   ash [--config PATH] host add NAME --address ADDRESS --user USER
-      [--port PORT] [--identity PATH] [--exec] [--read] [--write]
+      [--port PORT] [--identity PATH] [--shell-backend zellij|tmux]
+      [--exec] [--read] [--write]
+  ash [--config PATH] host add NAME --ssh-alias ALIAS
+      [--shell-backend zellij|tmux] [--exec] [--read] [--write]
 
 Adds a minimal deny-by-default host entry to the configuration file.
 Existing hosts or configurations are never overwritten.`
@@ -76,6 +79,21 @@ func HostAdd(args []string, path string, out, errout io.Writer) int {
 				return fail(fmt.Errorf("--identity requires a value"))
 			}
 			h.Identity = v
+		case "--ssh-alias":
+			v, ok := needValue()
+			if !ok {
+				return fail(fmt.Errorf("--ssh-alias requires a value"))
+			}
+			h.SSHAlias = v
+		case "--shell-backend":
+			v, ok := needValue()
+			if !ok {
+				return fail(fmt.Errorf("--shell-backend requires a value"))
+			}
+			if v != "zellij" && v != "tmux" {
+				return fail(fmt.Errorf("--shell-backend must be zellij or tmux"))
+			}
+			h.ShellBackend = v
 		case "--exec":
 			pol.Exec = true
 		case "--read":
@@ -86,17 +104,26 @@ func HostAdd(args []string, path string, out, errout io.Writer) int {
 			return fail(fmt.Errorf("unknown host add option %q", key))
 		}
 	}
-	if h.Address == "" || h.User == "" {
-		return fail(fmt.Errorf("host add requires --address and --user"))
+	if h.SSHAlias == "" && (h.Address == "" || h.User == "") {
+		return fail(fmt.Errorf("host add requires --address and --user, or --ssh-alias"))
 	}
-	if h.Port == 0 {
+	// An alias host leaves the port unset so OpenSSH resolves it; an explicit
+	// ASH port would override the alias.
+	if h.Port == 0 && h.SSHAlias == "" {
 		h.Port = 22
 	}
-	written, err := config.AddHost(path, name, host.Host{Address: h.Address, Port: h.Port, User: h.User, Identity: h.Identity, Policy: pol})
+	h.Policy = pol
+	written, err := config.AddHost(path, name, h)
 	if err != nil {
 		return fail(err)
 	}
 	result := map[string]any{"host": name, "address": h.Address, "user": h.User, "port": h.Port, "config": path, "written": written}
+	if h.SSHAlias != "" {
+		result["ssh_alias"] = h.SSHAlias
+	}
+	if h.ShellBackend != "" {
+		result["shell_backend"] = h.ShellBackend
+	}
 	if err := json.NewEncoder(out).Encode(result); err != nil {
 		return fail(err)
 	}

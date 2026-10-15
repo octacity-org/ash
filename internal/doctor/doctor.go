@@ -100,7 +100,7 @@ func (d *Doctor) Run(ctx context.Context, name string) Report {
 	}
 	report.Checks = append(report.Checks, d.shellCheck(ctx, h))
 	report.Checks = append(report.Checks, d.cacheCheck(ctx, h))
-	report.Checks = append(report.Checks, d.zellijCheck(ctx, h))
+	report.Checks = append(report.Checks, d.backendCheck(ctx, h))
 	return report
 }
 
@@ -171,7 +171,15 @@ func (d *Doctor) cacheCheck(ctx context.Context, h host.Host) Check {
 	}
 }
 
-func (d *Doctor) zellijCheck(ctx context.Context, h host.Host) Check {
+// backendCheck verifies the persistent-shell backend the host is configured for.
+func (d *Doctor) backendCheck(ctx context.Context, h host.Host) Check {
+	if h.ShellBackend == "tmux" {
+		r, err := d.exec(ctx, h, `command -v tmux >/dev/null 2>&1 && tmux -V`)
+		if err != nil || r.ExitCode != 0 {
+			return Check{Name: "tmux", Status: StatusWarn, Message: "tmux not found", Hint: "install tmux for persistent shells"}
+		}
+		return Check{Name: "tmux", Status: StatusOK, Message: firstLine(r.Stdout)}
+	}
 	r, err := d.exec(ctx, h, `command -v zellij >/dev/null 2>&1 && zellij --version`)
 	if err != nil || r.ExitCode != 0 {
 		return Check{Name: "zellij", Status: StatusWarn, Message: "Zellij not found", Hint: "install Zellij 0.44+ for persistent shells"}

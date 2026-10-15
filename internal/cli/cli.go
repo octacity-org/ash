@@ -16,11 +16,11 @@ import (
 const Usage = `Usage:
   ash --version
   ash [--config PATH] hosts
-	ash [--config PATH] host add NAME --address ADDRESS --user USER [--port N] [--identity PATH] [--exec] [--read] [--write]
+	ash [--config PATH] host add NAME (--address ADDRESS --user USER [--port N] [--identity PATH] | --ssh-alias ALIAS) [--shell-backend zellij|tmux] [--exec] [--read] [--write]
 	ash [--config PATH] doctor [HOST] [--json]
 	ash [--config PATH] exec HOST [--stdin] [--cwd PATH] [--env KEY=VALUE] [--timeout 30s] -- COMMAND...
 	ash [--config PATH] execv HOST [--stdin] [--cwd PATH] [--env KEY=VALUE] [--timeout 30s] -- PROGRAM ARG...
-  ash [--config PATH] read HOST PATH
+  ash [--config PATH] read HOST PATH [--offset N] [--limit N]
   ash [--config PATH] write HOST PATH [--atomic] < FILE
   ash [--config PATH] stat HOST PATH
   ash [--config PATH] list HOST PATH
@@ -41,6 +41,7 @@ const Usage = `Usage:
 COMMAND is shell code executed through the remote user's shell.
 execv runs PROGRAM with structured ARG words and strict quoting; no shell is involved.
 Quote remote ~/ paths to prevent your local shell from expanding them.
+Read with --offset or --limit returns a slice of any file size; a negative offset counts from the end.
 With --stdin, ASH forwards up to 64 KiB from standard input to the command.
 Shell send reads stdin if INPUT is omitted. Include a newline to execute input.
 Shell read returns a terminal snapshot; pass --cursor from a previous --json read for output added since then.
@@ -105,22 +106,16 @@ func Run(ctx context.Context, args []string, s *service.Service, shells *service
 			return 1
 		}
 		return r.ExitCode
-	case "read", "stat":
+	case "read":
+		if err := runRead(ctx, args[1:], s, out); err != nil {
+			return fail(err)
+		}
+		return 0
+	case "stat":
 		if len(args) != 3 {
-			return fail(fmt.Errorf("%s requires HOST PATH", args[0]))
+			return fail(fmt.Errorf("stat requires HOST PATH"))
 		}
-		name, path := args[1], args[2]
-		if args[0] == "read" {
-			data, err := s.Read(ctx, name, path)
-			if err != nil {
-				return fail(err)
-			}
-			if _, err := out.Write(data); err != nil {
-				return fail(err)
-			}
-			return 0
-		}
-		info, err := s.Stat(ctx, name, path)
+		info, err := s.Stat(ctx, args[1], args[2])
 		if err != nil {
 			return fail(err)
 		}

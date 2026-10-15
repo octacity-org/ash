@@ -166,7 +166,7 @@ func TestOpenSSH(t *testing.T) {
 		if e = tr.Mkdir(context.Background(), h, filepath.Join(root, "new")); e != nil {
 			t.Fatal(e)
 		}
-		if e = tr.Mkdir(context.Background(), h, filepath.Join(root, "new", "child")); e == nil {
+		if e = tr.Mkdir(context.Background(), h, filepath.Join(root, "missing", "child")); e == nil {
 			t.Fatal("mkdir created missing parents")
 		}
 		if e = tr.Rename(context.Background(), h, filepath.Join(root, "new"), filepath.Join(root, "moved")); e != nil {

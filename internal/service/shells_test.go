@@ -3,10 +3,12 @@ package service
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"ash/internal/audit"
 	"ash/internal/host"
 	"ash/internal/policy"
 	"ash/internal/shell"
@@ -253,4 +255,134 @@ func TestShellValidationAndCancellation(t *testing.T) {
 	if backend.calls != 0 {
 		t.Fatalf("backend called %d times", backend.calls)
 	}
+}
+
+type cwdCanonicalizer map[string]string
+
+func (c cwdCanonicalizer) Canonicalize(_ context.Context, _ host.Host, p string) (string, error) {
+	if v, ok := c[p]; ok {
+		return v, nil
+	}
+	return p, nil
+}
+
+func TestShellsHonorCommandConstraints(t *testing.T) {
+	backend := new(shellBackend)
+	s := NewShells(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true, AllowedCommands: []string{"ls"}}}}), backend)
+	ctx := context.Background()
+	id := "sh_" + strings.Repeat("a", 32)
+	_, e1 := s.Create(ctx, "h", "")
+	e2 := s.Send(ctx, "h", id, "rm -rf /\n")
+	_, e3 := s.Wait(ctx, "h", id, shell.WaitRequest{Timeout: time.Second})
+	for _, err := range []error{e1, e2, e3} {
+		if !errors.Is(err, policy.ErrPermissionDenied) {
+			t.Fatalf("got %v", err)
+		}
+	}
+	if backend.calls != 0 {
+		t.Fatalf("backend called %d times", backend.calls)
+	}
+	allowed := NewShells(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true, AllowedCommands: []string{"ls"}, AllowShell: true}}}), backend)
+	if _, err := allowed.Create(ctx, "h", ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestShellCreateEnforcesCwdRoots(t *testing.T) {
+	backend := new(shellBackend)
+	hosts := host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true, CwdRoots: []string{"/work"}}}})
+	ctx := context.Background()
+	unwired := NewShells(hosts, backend)
+	if _, err := unwired.Create(ctx, "h", "/work"); err == nil {
+		t.Fatal("cwd roots accepted without a canonicalizer")
+	}
+	s := NewShells(hosts, backend).WithCanonicalizer(cwdCanonicalizer{"~/link": "/etc"})
+	if _, err := s.Create(ctx, "h", "~/link"); !errors.Is(err, policy.ErrPermissionDenied) {
+		t.Fatalf("cwd outside roots: %v", err)
+	}
+	if backend.calls != 0 {
+		t.Fatal("denied cwd reached backend")
+	}
+	if _, err := s.Create(ctx, "h", "/work/app"); err != nil || backend.cwd != "/work/app" {
+		t.Fatalf("%v cwd=%q", err, backend.cwd)
+	}
+	if _, err := s.Create(ctx, "h", ""); err != nil {
+		t.Fatalf("default cwd: %v", err)
+	}
+}
+
+func TestShellInputAndWaitHonorPolicyBounds(t *testing.T) {
+	backend := new(shellBackend)
+	s := NewShells(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true, MaxInputBytes: 2}}}), backend)
+	id := "sh_" + strings.Repeat("a", 32)
+	if err := s.Send(context.Background(), "h", id, "abc"); !errors.Is(err, policy.ErrPermissionDenied) {
+		t.Fatalf("oversized policy input: %v", err)
+	}
+	if backend.calls != 0 {
+		t.Fatal("denied input reached backend")
+	}
+	empty := &waitBackend{}
+	capped := NewShells(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true, MaxTimeoutSeconds: 1}}}), empty)
+	started := time.Now()
+	result, err := capped.Wait(context.Background(), "h", id, shell.WaitRequest{Timeout: time.Minute})
+	if err != nil || !result.TimedOut || time.Since(started) > 5*time.Second {
+		t.Fatalf("%+v %v after %s", result, err, time.Since(started))
+	}
+}
+
+func TestShellAuditRecordsByteCounts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	recorder, err := audit.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := new(shellBackend)
+	s := NewShells(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true}}}), backend).WithAudit(recorder)
+	ctx := context.Background()
+	id := "sh_" + strings.Repeat("a", 32)
+	if err := s.Send(ctx, "h", id, "pwd\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Read(ctx, "h", id, ""); err != nil {
+		t.Fatal(err)
+	}
+	got := auditRecords(t, path)
+	if len(got) != 2 || got[0].Operation != "shell send" || got[0].BytesIn != 4 || got[1].Operation != "shell read" || got[1].BytesOut != int64(len("output")) {
+		t.Fatalf("%+v", got)
+	}
+}
+
+// SendWithCursor captures the cursor before delivering input, so a wait from
+// that cursor observes exactly the output the input produced.
+func TestSendWithCursorCapturesBeforeDelivery(t *testing.T) {
+	backend := &orderBackend{}
+	s := NewShells(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true}}}), backend)
+	id := "sh_" + strings.Repeat("a", 32)
+	cursor, err := s.SendWithCursor(context.Background(), "h", id, "make\n")
+	if err != nil || cursor != "before-send" || strings.Join(backend.events, ",") != "read,send" {
+		t.Fatalf("%q %v %v", cursor, err, backend.events)
+	}
+	missing := &orderBackend{readErr: shell.ErrNotFound}
+	if _, err := NewShells(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true}}}), missing).SendWithCursor(context.Background(), "h", id, "make\n"); !errors.Is(err, shell.ErrNotFound) || len(missing.events) != 1 {
+		t.Fatalf("%v %v", err, missing.events)
+	}
+}
+
+type orderBackend struct {
+	shell.Backend
+	events  []string
+	readErr error
+}
+
+func (b *orderBackend) Name() string { return "test" }
+func (b *orderBackend) Read(_ context.Context, _ host.Host, _ string, req shell.ReadRequest) (shell.Output, error) {
+	b.events = append(b.events, "read")
+	if b.readErr != nil {
+		return shell.Output{}, b.readErr
+	}
+	return shell.Output{Content: "old screen", Cursor: "before-send"}, nil
+}
+func (b *orderBackend) Send(context.Context, host.Host, string, string) error {
+	b.events = append(b.events, "send")
+	return nil
 }

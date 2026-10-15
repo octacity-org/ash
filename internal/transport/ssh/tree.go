@@ -150,6 +150,7 @@ type sftpDialer interface {
 	OpenFile(path string, f int) (sftpFile, error)
 	PosixRename(oldname, newname string) error
 	Remove(path string) error
+	Stat(path string) (os.FileInfo, error)
 }
 
 // clientDialer adapts *sftp.Client to sftpDialer.
@@ -195,7 +196,13 @@ func atomicWriteSFTP(fs sftpDialer, p string, data []byte) error {
 		// is not an error.
 		return closeWith(err)
 	}
-	if err := file.Chmod(0644); err != nil {
+	// Keep the replaced file's permission bits; only a new file gets 0644.
+	// Ownership cannot be preserved without privileges.
+	mode := os.FileMode(0644)
+	if info, err := fs.Stat(p); err == nil && info.Mode().IsRegular() {
+		mode = info.Mode().Perm()
+	}
+	if err := file.Chmod(mode); err != nil {
 		return closeWith(err)
 	}
 	if err := file.Close(); err != nil {

@@ -35,11 +35,13 @@ func AddHost(path, name string, h host.Host) (bool, error) {
 		}
 	}
 	body, err := toml.Marshal(struct {
-		Address  string `toml:"address"`
-		Port     int    `toml:"port,omitempty"`
-		User     string `toml:"user"`
-		Identity string `toml:"identity,omitempty"`
-	}{Address: h.Address, Port: h.Port, User: h.User, Identity: h.Identity})
+		Address      string `toml:"address,omitempty"`
+		Port         int    `toml:"port,omitempty"`
+		User         string `toml:"user,omitempty"`
+		Identity     string `toml:"identity,omitempty"`
+		SSHAlias     string `toml:"ssh_alias,omitempty"`
+		ShellBackend string `toml:"shell_backend,omitempty"`
+	}{Address: h.Address, Port: h.Port, User: h.User, Identity: h.Identity, SSHAlias: h.SSHAlias, ShellBackend: h.ShellBackend})
 	if err != nil {
 		return false, err
 	}

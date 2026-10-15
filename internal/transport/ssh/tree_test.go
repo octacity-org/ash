@@ -2,11 +2,13 @@ package ssh
 
 import (
 	"ash/internal/host"
+	"ash/internal/transport"
 	"context"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -190,6 +192,8 @@ func (l *legacyServer) PosixRename(oldname, newname string) error {
 	return &sftp.StatusError{Code: uint32(sftp.ErrSSHFxOpUnsupported)}
 }
 
+func (l *legacyServer) Stat(path string) (os.FileInfo, error) { return os.Stat(path) }
+
 func (l *legacyServer) Remove(path string) error {
 	*l.removed++
 	return os.Remove(path)
@@ -240,5 +244,74 @@ func assertNoTempFiles(t *testing.T, fs *sftp.Client, dir string) {
 		if len(e.Name()) > 9 && e.Name()[:9] == ".ash-tmp-" {
 			t.Fatalf("temporary file left behind: %s", e.Name())
 		}
+	}
+}
+
+// Atomic replacement keeps the destination's permission bits so edits never
+// strip an executable bit or widen a private file; new files get 0644.
+func TestAtomicWritePreservesExistingMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits")
+	}
+	f := newSFTPFixture(t)
+	ctx := context.Background()
+	for name, mode := range map[string]os.FileMode{"script.sh": 0o755, "secret.txt": 0o600} {
+		local := filepath.Join(f.root, name)
+		if err := os.WriteFile(local, []byte("old"), mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(local, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.tr.AtomicWrite(ctx, f.h, name, []byte("new")); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(local)
+		if err != nil || info.Mode().Perm() != mode {
+			t.Fatalf("%s mode = %v, want %v (%v)", name, info.Mode().Perm(), mode, err)
+		}
+	}
+	if err := f.tr.AtomicWrite(ctx, f.h, "fresh.txt", []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(filepath.Join(f.root, "fresh.txt")); err != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("new file mode = %v (%v)", info.Mode().Perm(), err)
+	}
+}
+
+// Ranged reads seek instead of loading the whole file, so they work past the
+// whole-file read limit; a negative offset counts back from the end.
+func TestReadRangeSlicesAndTails(t *testing.T) {
+	f := newSFTPFixture(t)
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(f.root, "digits"), []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		offset, limit int64
+		data          string
+		start         int64
+	}{
+		{2, 3, "234", 2},
+		{-3, 10, "789", 7},
+		{-100, 4, "0123", 0},
+		{20, 4, "", 10},
+	} {
+		r, err := f.tr.ReadRange(ctx, f.h, "digits", tc.offset, tc.limit)
+		if err != nil || string(r.Data) != tc.data || r.Offset != tc.start || r.Size != 10 {
+			t.Fatalf("offset %d limit %d: %+v %v", tc.offset, tc.limit, r, err)
+		}
+	}
+	big := make([]byte, transport.MaxReadSize+10)
+	copy(big[len(big)-4:], "tail")
+	if err := os.WriteFile(filepath.Join(f.root, "big"), big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.tr.Read(ctx, f.h, "big"); !errors.Is(err, transport.ErrTooLarge) {
+		t.Fatalf("whole read: %v", err)
+	}
+	r, err := f.tr.ReadRange(ctx, f.h, "big", -4, transport.MaxReadSize)
+	if err != nil || string(r.Data) != "tail" {
+		t.Fatalf("%q %v", r.Data, err)
 	}
 }

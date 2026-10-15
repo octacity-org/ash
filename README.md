@@ -78,7 +78,7 @@ read = true
 write = true
 ```
 
-ASH resolves the alias once at startup by running the installed OpenSSH client (`ssh -G -- ALIAS`), so aliases, `Include`, and `Match` behave exactly as OpenSSH does. Precedence is explicit ASH value, then the resolved OpenSSH value, then the ASH default; the ASH host name stays separate from the resolved address. Resolved fields include hostname, user, port, identity files (loaded in order), `IdentityAgent`, and `HostKeyAlias`. ASH deliberately rejects an alias that uses `ProxyJump`, `ProxyCommand`, `CertificateFile`, or `PKCS11Provider`, naming the directive before any network access, rather than emulating it partially. Hosts without `ssh_alias` keep the pure-Go behavior and never invoke OpenSSH.
+ASH resolves the alias once at startup by running the installed OpenSSH client (`ssh -G -- ALIAS`), so aliases, `Include`, and `Match` behave exactly as OpenSSH does. Precedence is explicit ASH value, then the resolved OpenSSH value, then the ASH default; the ASH host name stays separate from the resolved address. Resolved fields include hostname, user, port, identity files (loaded in order), `IdentityAgent`, `HostKeyAlias`, and `UserKnownHostsFile` (every listed file that exists is trusted; at least one must exist). ASH deliberately rejects an alias that uses `ProxyJump`, `ProxyCommand`, `CertificateFile`, `PKCS11Provider`, or `UserKnownHostsFile none`, naming the directive before any network access, rather than emulating it partially. Hosts without `ssh_alias` keep the pure-Go behavior and never invoke OpenSSH.
 
 ### Restrict a host
 
@@ -99,7 +99,7 @@ max_input_bytes = 65536
 max_output_bytes = 1048576
 ```
 
-Roots are **remote absolute POSIX paths**. Empty fields preserve the previous broad behavior. Paths are canonicalized through SFTP (`realpath` of the target, or of the nearest existing parent for a create) and enforced component-wise before the operation, so symlink escapes are rejected. `allowed_commands` restricts argv execution only; shell code can invoke anything, so when it is set ASH refuses shell-code `exec` unless `allow_shell = true`, which explicitly bypasses executable restrictions. Timeout, input, and output bounds allow a request to choose *smaller* values but never larger ones, and configurable bounds may not exceed the compiled hard caps.
+Roots are **remote absolute POSIX paths**. Empty fields preserve the previous broad behavior. Paths are canonicalized through SFTP (`realpath` of the target, or of the nearest existing parent for a create) and enforced component-wise before the operation, so symlink escapes are rejected. `allowed_commands` restricts argv execution only; shell code can invoke anything, so when it is set ASH refuses shell-code `exec` and persistent shells unless `allow_shell = true`, which explicitly bypasses executable restrictions. Persistent shells also honor `cwd_roots` for their starting directory, `max_input_bytes` for each send, and `max_timeout_seconds` as a cap on `wait`. Timeout, input, and output bounds allow a request to choose *smaller* values but never larger ones, and configurable bounds may not exceed the compiled hard caps.
 
 Set a top-level `audit_log` to append structured, local JSONL records of operations:
 
@@ -107,13 +107,14 @@ Set a top-level `audit_log` to append structured, local JSONL records of operati
 audit_log = "~/.local/state/ash/audit.jsonl"
 ```
 
-Each record contains the time, operation, ASH host, policy decision, duration, result category, byte counts, and truncation. Records deliberately omit command text, argv values, paths, file contents, environment variables, credentials, stdout, and stderr. The file is created owner-only (`0600`). Audit writes are fail-open: a write error never fails the operation.
+Each record contains the time, operation, ASH host, policy decision, duration, result category, byte counts, and truncation. `bytes_in` counts payload sent to the host (stdin, written content, shell input) and `bytes_out` payload returned from it (command output, read content, shell output); `truncated` marks a bounded result. Records deliberately omit command text, argv values, paths, file contents, environment variables, credentials, stdout, and stderr. The file is created owner-only (`0600`). Audit writes are fail-open: a write error never fails the operation.
 
 ## CLI
 
 ```sh
 ./ash hosts
 ./ash host add example --address server.example.com --user remote-user --exec --read --write
+./ash host add box --ssh-alias my-server --shell-backend tmux --read
 ./ash doctor
 ./ash doctor example
 ./ash doctor example --json
@@ -122,6 +123,7 @@ Each record contains the time, operation, ASH host, policy decision, duration, r
 ./ash execv example -- systemctl is-active nginx
 printf '{"ok":true}' | ./ash exec example --stdin -- elephant receive
 ./ash read example /etc/os-release
+./ash read example /var/log/syslog --offset -65536
 printf 'hello from ASH\n' | ./ash write example /tmp/ash-test.txt
 printf 'hello from ASH\n' | ./ash write example /tmp/ash-test.txt --atomic
 ./ash stat example /tmp/ash-test.txt
@@ -143,17 +145,17 @@ printf 'hello from ASH\n' | ./ash write example /tmp/ash-test.txt --atomic
 
 `execv` runs a structured `PROGRAM ARG...` without a shell, quoting every word literally, so `allowed_commands` can be enforced. It shares `--cwd`, `--env`, and `--timeout` with `exec`.
 
-Command stdout and stderr stay separate, and the CLI returns the remote process exit code. ASH failures print a diagnostic to stderr and return `1`. `hosts`, `stat`, and `list` print JSON; `read` writes file bytes to stdout; `write` consumes stdin and creates or truncates the file. Parent directories must exist. Pass `--atomic` to `write` to replace the destination through a same-directory temporary file, fsync, and rename, so an interrupted write leaves the prior file intact.
+Command stdout and stderr stay separate, and the CLI returns the remote process exit code. ASH failures print a diagnostic to stderr and return `1`. `hosts`, `stat`, and `list` print JSON; `read` writes file bytes to stdout, and with `--offset N` and/or `--limit N` writes a slice of a file of any size (a negative offset counts from the end; the limit is at most 4 MiB); `write` consumes stdin and creates or truncates the file. Parent directories must exist. Pass `--atomic` to `write` to replace the destination through a same-directory temporary file, fsync, and rename, so an interrupted write leaves the prior file intact. An atomic replacement keeps the existing file's permission bits (new files get `0644`); ownership is not preserved.
 
 `mkdir` creates one directory without implicit parents. `rename` moves a file or directory. `remove` deletes a file or an empty directory and is never recursive; enumerate a tree with `list` before deleting it. `download` and `upload` map a bounded remote tree to and from a local directory without archives: remote symlinks are skipped, and absolute paths, `..`, NUL, duplicates, type conflicts, depth/entry/byte limits (depth 32, 1000 entries, 4 MiB) are rejected before the first remote mutation. A recursive transfer that fails part-way leaves earlier entries in place; there is no rollback.
 
-`host add` appends a minimal, deny-by-default entry to the configuration file. It never overwrites an existing host or an unparseable file; capabilities are granted explicitly with `--exec`, `--read`, and `--write`.
+`host add` appends a minimal, deny-by-default entry to the configuration file. It never overwrites an existing host or an unparseable file; capabilities are granted explicitly with `--exec`, `--read`, and `--write`. Pass `--ssh-alias ALIAS` instead of `--address`/`--user` to reference an OpenSSH alias, and `--shell-backend tmux` to select the tmux backend.
 
-`doctor` validates configuration and SSH trust without connecting when no host is named. For a host it reports configuration, host resolution, policy, known-hosts, host-key trust, authentication, POSIX shell availability, remote cache permissions, and Zellij availability as separate checks, each with an actionable hint, and exits non-zero when a check fails. It never prints identity paths, key material, or environment secrets. Pass `--json` for stable structured output.
+`doctor` validates configuration and SSH trust without connecting when no host is named. For a host it reports configuration, host resolution, policy, known-hosts, host-key trust, authentication, POSIX shell availability, remote cache permissions, and availability of the host's shell backend (Zellij or tmux) as separate checks, each with an actionable hint, and exits non-zero when a check fails. It never prints identity paths, key material, or environment secrets. Pass `--json` for stable structured output.
 
 Pass `--stdin` to forward standard input to the remote command, avoiding shell-quoting and command-size limits. Input is bounded at 64 KiB and fails clearly when exceeded. Without `--stdin`, ASH neither reads nor forwards standard input.
 
-Commands default to a five-minute timeout. File operations default to 30 seconds. Cancellation closes the SSH connection/session; it does not guarantee termination of detached remote descendants. Each operation opens and closes its own SSH connection.
+Commands default to a five-minute timeout. File operations default to 30 seconds. Cancellation closes the SSH connection/session; it does not guarantee termination of detached remote descendants. Verified SSH connections are pooled, and a pooled connection keeps one SFTP session open for consecutive file operations.
 
 Each command output stream is capped at 8 MiB and reports truncation. Reads and writes are capped at 4 MiB. These limits bound captured output/file data, not all memory used by an MCP client's incoming protocol message.
 
@@ -184,13 +186,13 @@ printf 'pwd\n' | ./ash shell send example "$SHELL_ID"
 ./ash shell close example "$SHELL_ID"
 ```
 
-`send` accepts an optional literal INPUT argument, or reads stdin when omitted. It adds no newline: include one to submit a command. It returns after delivering input, without waiting for the shell command to finish. Input is UTF-8 without NUL and is limited to 64 KiB.
+`send` accepts an optional literal INPUT argument, or reads stdin when omitted. It adds no newline: include one to submit a command. It returns after delivering input, without waiting for the shell command to finish. Input is UTF-8 without NUL and is limited to 64 KiB. Over MCP, `ash_shell_send` returns a `cursor` captured just before delivery; pass it to `ash_shell_wait` to observe only the output that input produced, without a separate read.
 
 `read` returns rendered terminal text and available scrollback, with stdout and stderr merged. Without a cursor it returns a full snapshot (and may repeat previous output). `--json` includes an opaque `cursor`; pass `--cursor VALUE` on the next read to receive only output added since the snapshot that produced it. A cursor is a byte-delta optimization over append-like output, not a terminal event log: if the pane changed, scrollback was truncated, or a redraw altered earlier bytes, the read returns a full snapshot with `resync: true` and a fresh cursor. Expired or malformed cursors resynchronize rather than fail. Snapshots are bounded by the existing 8 MiB transport limit and report truncation. This is a polling interface, with no streaming or full-screen TUI support and no per-command exit status. Use one-shot `exec` when you need a structured command result.
 
 `wait` blocks until new output arrives, or until a `--until` literal or `--regex` expression appears, and returns the observed output plus the next cursor. `--timeout` must be positive and is capped at five minutes. On timeout the persistent shell stays open; `--json` reports `matched`, `timed_out`, `truncated`, and `resync`. Matching runs against the bounded new output across chunk boundaries. This observes terminal output, not command completion or exit status.
 
-Every shell operation requires the host's existing `exec` capability. No additional policy flag is introduced. ASH-generated IDs map to reserved remote session names; ASH lists and controls only sessions in that namespace. Liveness is queried from Zellij, with no local session metadata to become stale. Exited sessions are not listed. Closing a shell is idempotent and also removes its ASH-owned backend configuration after an external termination. The namespace is organizational ownership, not isolation from other processes running as the same remote account. Zellij startup settings live in the remote `~/.cache/ash/shells/ID/config.kdl` until the shell is closed; this file is configuration, not a liveness record.
+Every shell operation requires the host's existing `exec` capability and the same shell-code permission as `exec` (see `allowed_commands` above). No additional policy flag is introduced. ASH-generated IDs map to reserved remote session names; ASH lists and controls only sessions in that namespace. Liveness is queried from Zellij, with no local session metadata to become stale. Exited sessions are not listed. Closing a shell is idempotent and also removes its ASH-owned backend configuration after an external termination. The namespace is organizational ownership, not isolation from other processes running as the same remote account. Zellij startup settings live in the remote `~/.cache/ash/shells/ID/config.kdl` until the shell is closed; this file is configuration, not a liveness record.
 
 Control operations have a 30-second deadline. That deadline limits the control request, not the lifetime of the persistent shell or a command sent to it. Persistence covers ASH/SSH disconnects, not host reboots or termination of Zellij. Treat a canceled or failed send as potentially delivered; do not blindly retry commands with side effects.
 
@@ -234,9 +236,9 @@ Client configuration formats vary. ASH serves only stdio; stdout is reserved for
 
 | Tool | Inputs | Result |
 | --- | --- | --- |
-| `ash_hosts` | `{}` | Public host metadata and capabilities |
+| `ash_hosts` | `{}` | Public host metadata, capabilities, `shell_backend`, and any policy limits (`read_roots`, `write_roots`, `cwd_roots`, `allowed_commands`, `allow_shell`, `max_timeout_seconds`, `max_input_bytes`, `max_output_bytes`) |
 | `ash_exec` | `host`, `command` **or** `argv`; optional `cwd`, `env`, `timeout_ms`, `stdin`, `stdin_base64` | `exit_code`, `stdout`, `stderr`, truncation flags, `duration_ms` |
-| `ash_read` | `host`, `path`; optional `encoding` (`text`/`base64`) | `content` or `content_base64`, and byte `size` |
+| `ash_read` | `host`, `path`; optional `encoding` (`text`/`base64`), `offset`, `limit` | `content` or `content_base64`, and byte `size`; slice reads add `offset` and `file_size` |
 | `ash_write` | `host`, `path`, `content` or `content_base64` | Written byte `size` |
 | `ash_stat` | `host`, `path` | `path`, `size`, `mode`, `is_dir`, `modified_at` |
 | `ash_list` | `host`, `path` | `entries`: direct children with `name`, `path`, `size`, `mode`, `modified_at`, `is_dir`, `symlink` |
@@ -248,12 +250,12 @@ Client configuration formats vary. ASH serves only stdio; stdout is reserved for
 | `ash_upload` | `host`, `path`, `entries` | Written byte `size` |
 | `ash_shell_create` | `host`; optional `cwd` | `id`, `host`, `backend` |
 | `ash_shell_list` | `host` | `shells`: live ASH-owned shells |
-| `ash_shell_send` | `host`, `shell_id`, `input` | `sent` |
+| `ash_shell_send` | `host`, `shell_id`, `input` | `sent`, `cursor` (captured before delivery) |
 | `ash_shell_read` | `host`, `shell_id`; optional `cursor` | `content`, `cursor`, `truncated`, `resync` |
 | `ash_shell_wait` | `host`, `shell_id`, `timeout_ms`; optional `cursor`, `until`, `regex` | `content`, `cursor`, `matched`, `truncated`, `resync`, `timed_out` |
 | `ash_shell_close` | `host`, `shell_id` | `closed` |
 
-`ash_exec` accepts standard input as UTF-8 `stdin` or base64 `stdin_base64` (mutually exclusive, at most 64 KiB); set either to an empty value to send empty input. A non-zero remote process exit is a successful MCP tool result. Connection, authentication, trust, policy and timeout failures are tool errors. `ash_read` returns UTF-8 `content` by default and rejects invalid UTF-8; pass `encoding: "base64"` for binary files. `ash_write` and `ash_write_atomic` accept `content` or `content_base64`, but not both. Host listings omit identity paths and authentication internals.
+`ash_exec` accepts standard input as UTF-8 `stdin` or base64 `stdin_base64` (mutually exclusive, at most 64 KiB); set either to an empty value to send empty input. A non-zero remote process exit is a successful MCP tool result. Connection, authentication, trust, policy and timeout failures are tool errors. `ash_read` returns UTF-8 `content` by default and rejects invalid UTF-8; pass `encoding: "base64"` for binary files. Setting `offset` or `limit` reads a slice of a file of any size (negative `offset` tails it); text slices drop a partial UTF-8 character at either edge and report the adjusted `offset`, so the next slice can start at `offset + size`. `ash_write` and `ash_write_atomic` accept `content` or `content_base64`, but not both. Host listings omit identity paths and authentication internals.
 
 Capabilities grant access with the remote account's permissions. A bare boolean `exec`/`read`/`write` does not constrain paths or commands, and an enabled `exec` capability can itself read or modify files. Optional policy fields (`read_roots`, `write_roots`, `cwd_roots`, `allowed_commands`, `allow_shell`, bound settings) add enforcement; configure only hosts and accounts you intend the connected agent to operate.
 

@@ -357,3 +357,26 @@ func TestCacheCheckRunsSingleCommand(t *testing.T) {
 		t.Fatalf("cache state must come from one combined probe, got %d invocations", count)
 	}
 }
+
+func TestTmuxHostChecksTmuxNotZellij(t *testing.T) {
+	f := &fakeTransport{results: map[string]transport.ExecResult{
+		`command -v tmux >/dev/null 2>&1 && tmux -V`: {Stdout: "tmux 3.4\n"},
+	}}
+	known := filepath.Join(t.TempDir(), "known_hosts")
+	if err := os.WriteFile(known, []byte("host ssh-ed25519 AAAA\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := New(host.New(map[string]host.Host{"h": {Address: "example", Port: 22, User: "u", ShellBackend: "tmux", Policy: policy.Policy{Exec: true}}}), f, known)
+	report := d.Run(context.Background(), "h")
+	if check, ok := findCheck(report.Checks, "tmux"); !ok || check.Status != StatusOK || check.Message != "tmux 3.4" {
+		t.Fatalf("tmux check: %+v", report.Checks)
+	}
+	if _, ok := findCheck(report.Checks, "zellij"); ok {
+		t.Fatalf("zellij checked on a tmux host: %+v", report.Checks)
+	}
+	f.results = map[string]transport.ExecResult{`command -v tmux >/dev/null 2>&1 && tmux -V`: {ExitCode: 1}}
+	report = d.Run(context.Background(), "h")
+	if check, ok := findCheck(report.Checks, "tmux"); !ok || check.Status != StatusWarn || report.Failed() {
+		t.Fatalf("missing tmux: %+v", report.Checks)
+	}
+}

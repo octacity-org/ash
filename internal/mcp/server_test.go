@@ -241,7 +241,10 @@ func TestPersistentShellTools(t *testing.T) {
 	if len(list["shells"].([]any)) != 1 {
 		t.Fatal(list)
 	}
-	call("ash_shell_send", map[string]any{"host": "h", "shell_id": id, "input": "pwd\n"})
+	sent := call("ash_shell_send", map[string]any{"host": "h", "shell_id": id, "input": "pwd\n"})
+	if sent["sent"] != true || sent["cursor"] != "next" {
+		t.Fatal(sent)
+	}
 	output := call("ash_shell_read", map[string]any{"host": "h", "shell_id": id})
 	if output["content"] != "pwd\n" || output["truncated"] != false {
 		t.Fatal(output)
@@ -258,5 +261,41 @@ func TestPersistentShellTools(t *testing.T) {
 	denied, err := cs.CallTool(ctx, &sdk.CallToolParams{Name: "ash_shell_create", Arguments: map[string]any{"host": "denied"}})
 	if err != nil || !denied.IsError {
 		t.Fatalf("%v %v", denied, err)
+	}
+}
+
+type rangeReadTransport struct{ transport.Transport }
+
+func (rangeReadTransport) ReadRange(_ context.Context, _ host.Host, _ string, offset, limit int64) (transport.FileRange, error) {
+	return transport.FileRange{Data: []byte("tail\n"), Offset: 95, Size: 100}, nil
+}
+
+func TestReadToolRange(t *testing.T) {
+	ctx := context.Background()
+	server := New(service.New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Read: true}}}), rangeReadTransport{}), nil)
+	st, ct := sdk.NewInMemoryTransports()
+	ss, err := server.Connect(ctx, st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+	cs, err := sdk.NewClient(&sdk.Implementation{Name: "test", Version: "1"}, nil).Connect(ctx, ct, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.Close()
+	res, err := cs.CallTool(ctx, &sdk.CallToolParams{Name: "ash_read", Arguments: map[string]any{"host": "h", "path": "/log", "offset": -5}})
+	if err != nil || res.IsError {
+		t.Fatalf("%+v %v", res, err)
+	}
+	data, _ := json.Marshal(res.StructuredContent)
+	var out struct {
+		Content  string `json:"content"`
+		Size     int    `json:"size"`
+		Offset   *int64 `json:"offset"`
+		FileSize *int64 `json:"file_size"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil || out.Content != "tail\n" || out.Size != 5 || out.Offset == nil || *out.Offset != 95 || out.FileSize == nil || *out.FileSize != 100 {
+		t.Fatalf("%s %v", data, err)
 	}
 }

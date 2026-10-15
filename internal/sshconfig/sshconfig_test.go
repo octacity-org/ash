@@ -54,15 +54,26 @@ func TestResolveAgentAndUnsupportedDirectives(t *testing.T) {
 		t.Fatalf("%+v %v", effective, err)
 	}
 	for directive, output := range map[string]string{
-		"ProxyJump":       "proxyjump bastion\n",
-		"ProxyCommand":    "proxycommand /usr/bin/nc %h %p\n",
-		"CertificateFile": "certificatefile ~/.ssh/id.crt\n",
-		"PKCS11Provider":  "pkcs11provider /usr/lib/pkcs11.so\n",
+		"ProxyJump":               "proxyjump bastion\n",
+		"ProxyCommand":            "proxycommand /usr/bin/nc %h %p\n",
+		"CertificateFile":         "certificatefile ~/.ssh/id.crt\n",
+		"PKCS11Provider":          "pkcs11provider /usr/lib/pkcs11.so\n",
+		"UserKnownHostsFile none": "userknownhostsfile none\n",
 	} {
 		_, err := resolve(context.Background(), "a", fakeRunner(output, nil))
 		if !errors.Is(err, ErrUnsupported) || !strings.Contains(err.Error(), directive) {
 			t.Fatalf("%s: %v", directive, err)
 		}
+	}
+}
+
+func TestResolveKnownHostsFiles(t *testing.T) {
+	effective, err := resolve(context.Background(), "a", fakeRunner("userknownhostsfile ~/.ssh/team_hosts /etc/ash/hosts\n", nil))
+	if err != nil || strings.Join(effective.KnownHostsFiles, "|") != "~/.ssh/team_hosts|/etc/ash/hosts" {
+		t.Fatalf("%+v %v", effective, err)
+	}
+	if applied := effective.Apply(host.Host{}); strings.Join(applied.KnownHostsFiles, "|") != "~/.ssh/team_hosts|/etc/ash/hosts" {
+		t.Fatalf("%+v", applied)
 	}
 }
 

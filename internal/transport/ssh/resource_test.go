@@ -6,10 +6,13 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"net"
+	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/pkg/sftp"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -242,5 +245,98 @@ func TestPooledResourceCloseOnceAcrossShutdownAndRelease(t *testing.T) {
 	}
 	if res.lifecycle.cleanup != nil || res.lifecycle.stop != nil {
 		t.Fatal("lifecycle must be detached after close")
+	}
+}
+
+// sftpSSHResource connects to an in-process SSH server that serves the SFTP
+// subsystem from dir and counts how many SFTP sessions were opened.
+func sftpSSHResource(t *testing.T, dir string) (*sshResource, *atomic.Int32) {
+	t.Helper()
+	_, serverPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverKey, err := gossh.NewSignerFromKey(serverPrivate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverConfig := &gossh.ServerConfig{NoClientAuth: true}
+	serverConfig.AddHostKey(serverKey)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	sessions := new(atomic.Int32)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		_, chans, reqs, err := gossh.NewServerConn(conn, serverConfig)
+		if err != nil {
+			return
+		}
+		go gossh.DiscardRequests(reqs)
+		for newChannel := range chans {
+			channel, requests, err := newChannel.Accept()
+			if err != nil {
+				continue
+			}
+			go func() {
+				for req := range requests {
+					ok := req.Type == "subsystem" && len(req.Payload) > 4 && string(req.Payload[4:]) == "sftp"
+					req.Reply(ok, nil)
+					if ok {
+						sessions.Add(1)
+						server, err := sftp.NewServer(channel, sftp.WithServerWorkingDirectory(dir))
+						if err == nil {
+							go func() { server.Serve(); channel.Close() }()
+						}
+					}
+				}
+			}()
+		}
+	}()
+	client, err := gossh.Dial("tcp", listener.Addr().String(), &gossh.ClientConfig{User: "u", Auth: []gossh.AuthMethod{gossh.Password("")}, HostKeyCallback: gossh.InsecureIgnoreHostKey()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := &sshResource{client: client}
+	t.Cleanup(func() { res.close() })
+	return res, sessions
+}
+
+// A pooled connection keeps one SFTP session across file operations, so a
+// root-checked read no longer opens a subsystem for canonicalization and
+// another for the read. A session that ended is replaced transparently.
+func TestPooledConnectionReusesSFTPSession(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "file.txt"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, sessions := sftpSSHResource(t, dir)
+	tr, _ := newWiringHarness(t)
+	tr.setDial(func(context.Context, host.Host) (*sshResource, error) { return res, nil })
+	ctx := context.Background()
+	h := hostForTest("sftp-reuse")
+	if _, err := tr.Canonicalize(ctx, h, "file.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := tr.Read(ctx, h, "file.txt"); err != nil || string(data) != "data" {
+		t.Fatalf("%q %v", data, err)
+	}
+	if _, err := tr.Stat(ctx, h, "file.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if n := sessions.Load(); n != 1 {
+		t.Fatalf("opened %d SFTP sessions, want 1", n)
+	}
+	res.sftp.Close()
+	if _, err := tr.Stat(ctx, h, "file.txt"); err != nil {
+		t.Fatalf("after session end: %v", err)
+	}
+	if n := sessions.Load(); n != 2 {
+		t.Fatalf("opened %d SFTP sessions after session end, want 2", n)
 	}
 }

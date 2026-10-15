@@ -45,6 +45,12 @@ type ShellService struct {
 	backends       map[string]shell.Backend
 	defaultBackend string
 	audit          *audit.Recorder
+	paths          canonicalizer
+}
+
+// canonicalizer resolves a remote path so cwd roots can be enforced.
+type canonicalizer interface {
+	Canonicalize(context.Context, host.Host, string) (string, error)
 }
 
 func NewShells(hosts *host.Registry, backend shell.Backend) *ShellService {
@@ -80,17 +86,25 @@ func (s *ShellService) backendFor(h host.Host) (shell.Backend, error) {
 	return backend, nil
 }
 
+// WithCanonicalizer attaches the path resolver used to enforce cwd roots.
+// Without one, hosts with cwd roots refuse an explicit shell cwd.
+func (s *ShellService) WithCanonicalizer(c canonicalizer) *ShellService {
+	s.paths = c
+	return s
+}
+
 // WithAudit attaches one audit recorder to the shell service.
 func (s *ShellService) WithAudit(recorder *audit.Recorder) *ShellService {
 	s.audit = recorder
 	return s
 }
 
-func (s *ShellService) finish(operation, name string, started time.Time, err error) {
+func (s *ShellService) finish(operation, name string, started time.Time, err error, u usage) {
 	if s.audit == nil {
 		return
 	}
-	record := audit.Record{Operation: operation, Host: name, Decision: audit.Allowed, Result: audit.ResultOK, DurationMS: time.Since(started).Milliseconds()}
+	record := audit.Record{Operation: operation, Host: name, Decision: audit.Allowed, Result: audit.ResultOK, DurationMS: time.Since(started).Milliseconds(),
+		BytesIn: int64(u.in), BytesOut: int64(u.out), Truncated: u.truncated}
 	if err != nil {
 		record.Result = audit.ResultError
 	}
@@ -102,7 +116,12 @@ func (s *ShellService) resolve(ctx context.Context, name string) (host.Host, err
 	if err != nil {
 		return h, err
 	}
-	if err = h.Policy.Check("exec"); err != nil {
+	// A persistent shell runs arbitrary shell code, so it is gated exactly
+	// like shell-code exec.
+	if err = h.Policy.Check("exec"); err == nil {
+		err = h.Policy.CheckShell()
+	}
+	if err != nil {
 		err = fmt.Errorf("host %q: shell: %w", name, err)
 		s.audit.Record(audit.Record{Operation: "shell", Host: name, Decision: audit.Denied, Result: audit.ResultError})
 		return h, err
@@ -119,7 +138,7 @@ func (s *ShellService) info(backend shell.Backend, name, id string) shell.Info {
 
 func (s *ShellService) Create(ctx context.Context, name, cwd string) (info shell.Info, err error) {
 	started := time.Now()
-	defer func() { s.finish("shell create", name, started, err) }()
+	defer func() { s.finish("shell create", name, started, err, usage{}) }()
 	h, err := s.resolve(ctx, name)
 	if err != nil {
 		return shell.Info{}, err
@@ -138,6 +157,18 @@ func (s *ShellService) Create(ctx context.Context, name, cwd string) (info shell
 	id := "sh_" + hex.EncodeToString(random[:])
 	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
 	defer cancel()
+	if cwd != "" && len(h.Policy.CwdRoots) > 0 {
+		if s.paths == nil {
+			return shell.Info{}, fmt.Errorf("host %q: shell create: cwd roots cannot be enforced", name)
+		}
+		canonical, err := s.paths.Canonicalize(ctx, h, cwd)
+		if err != nil {
+			return shell.Info{}, operationError(ctx, name, "shell create", err)
+		}
+		if err := h.Policy.CheckCwd(canonical); err != nil {
+			return shell.Info{}, fmt.Errorf("host %q: shell create: %w", name, err)
+		}
+	}
 	if err = backend.Create(ctx, h, id, cwd); err != nil {
 		return shell.Info{}, operationError(ctx, name, "shell create", err)
 	}
@@ -146,7 +177,7 @@ func (s *ShellService) Create(ctx context.Context, name, cwd string) (info shell
 
 func (s *ShellService) List(ctx context.Context, name string) (out []shell.Info, err error) {
 	started := time.Now()
-	defer func() { s.finish("shell list", name, started, err) }()
+	defer func() { s.finish("shell list", name, started, err, usage{}) }()
 	h, err := s.resolve(ctx, name)
 	if err != nil {
 		return nil, err
@@ -169,34 +200,61 @@ func (s *ShellService) List(ctx context.Context, name string) (out []shell.Info,
 	return out, nil
 }
 
-func (s *ShellService) Send(ctx context.Context, name, id, input string) (err error) {
+func (s *ShellService) Send(ctx context.Context, name, id, input string) error {
+	_, err := s.send(ctx, name, id, input, false)
+	return err
+}
+
+// SendWithCursor captures the shell's cursor immediately before delivering
+// input, so a Wait from that cursor observes only output produced after it.
+// Capturing costs one extra snapshot read.
+func (s *ShellService) SendWithCursor(ctx context.Context, name, id, input string) (string, error) {
+	return s.send(ctx, name, id, input, true)
+}
+
+func (s *ShellService) send(ctx context.Context, name, id, input string, mark bool) (cursor string, err error) {
 	started := time.Now()
-	defer func() { s.finish("shell send", name, started, err) }()
+	defer func() { s.finish("shell send", name, started, err, usage{in: len(input)}) }()
 	h, err := s.resolve(ctx, name)
 	if err != nil {
-		return err
+		return "", err
 	}
 	backend, err := s.backendFor(h)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err = shell.ValidateID(id); err != nil {
-		return err
+		return "", err
 	}
 	if len(input) > shell.MaxInputSize {
-		return fmt.Errorf("shell input exceeds %d byte limit", shell.MaxInputSize)
+		return "", fmt.Errorf("shell input exceeds %d byte limit", shell.MaxInputSize)
 	}
 	if !utf8.ValidString(input) || strings.ContainsRune(input, 0) {
-		return fmt.Errorf("shell input must be UTF-8 without NUL")
+		return "", fmt.Errorf("shell input must be UTF-8 without NUL")
+	}
+	if err = h.Policy.CheckInput(len(input)); err != nil {
+		return "", fmt.Errorf("host %q: shell send: %w", name, err)
 	}
 	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
 	defer cancel()
-	return operationError(ctx, name, "shell send", backend.Send(ctx, h, id, input))
+	if mark {
+		before, err := backend.Read(ctx, h, id, shell.ReadRequest{})
+		if err != nil {
+			return "", operationError(ctx, name, "shell send", err)
+		}
+		cursor = before.Cursor
+	}
+	if err = backend.Send(ctx, h, id, input); err != nil {
+		return "", operationError(ctx, name, "shell send", err)
+	}
+	return cursor, nil
 }
 
 func (s *ShellService) Read(ctx context.Context, name, id, cursor string) (out shell.Output, err error) {
 	started := time.Now()
-	defer func() { s.finish("shell read", name, started, err) }()
+	defer func() {
+		s.finish("shell read", name, started, err, usage{out: len(out.Content), truncated: out.Truncated})
+	}()
 	h, err := s.resolve(ctx, name)
 	if err != nil {
 		return shell.Output{}, err
@@ -225,7 +283,9 @@ func (s *ShellService) Read(ctx context.Context, name, id, cursor string) (out s
 // It accumulates only bounded new output and matches across chunk boundaries.
 func (s *ShellService) Wait(ctx context.Context, name, id string, req shell.WaitRequest) (result shell.WaitResult, err error) {
 	started := time.Now()
-	defer func() { s.finish("shell wait", name, started, err) }()
+	defer func() {
+		s.finish("shell wait", name, started, err, usage{out: len(result.Content), truncated: result.Truncated})
+	}()
 	h, err := s.resolve(ctx, name)
 	if err != nil {
 		return shell.WaitResult{}, err
@@ -245,6 +305,9 @@ func (s *ShellService) Wait(ctx context.Context, name, id string, req shell.Wait
 	}
 	if req.Timeout <= 0 || req.Timeout > MaxWaitTimeout {
 		return shell.WaitResult{}, fmt.Errorf("timeout must be positive and at most %s", MaxWaitTimeout)
+	}
+	if limit := h.Policy.MaxTimeout(); limit > 0 && req.Timeout > limit {
+		req.Timeout = limit
 	}
 	var matcher *regexp.Regexp
 	if req.Regex != "" {
@@ -321,7 +384,7 @@ func matchWait(req shell.WaitRequest, matcher *regexp.Regexp, accumulated []byte
 
 func (s *ShellService) Close(ctx context.Context, name, id string) (err error) {
 	started := time.Now()
-	defer func() { s.finish("shell close", name, started, err) }()
+	defer func() { s.finish("shell close", name, started, err, usage{}) }()
 	h, err := s.resolve(ctx, name)
 	if err != nil {
 		return err

@@ -70,10 +70,15 @@ type fileTransport struct {
 	readTree   []transport.TreeEntry
 	writeRoot  string
 	writeTree  []transport.TreeEntry
+	rangeArgs  [2]int64
 }
 
 func (f *fileTransport) List(context.Context, host.Host, string) ([]transport.DirEntry, error) {
 	return f.list, nil
+}
+func (f *fileTransport) ReadRange(_ context.Context, _ host.Host, _ string, offset, limit int64) (transport.FileRange, error) {
+	f.rangeArgs = [2]int64{offset, limit}
+	return transport.FileRange{Data: []byte("slice"), Offset: 3, Size: 9}, nil
 }
 func (f *fileTransport) Mkdir(context.Context, host.Host, string) error          { return nil }
 func (f *fileTransport) Rename(context.Context, host.Host, string, string) error { return nil }
@@ -105,6 +110,12 @@ func TestFileCLIOperations(t *testing.T) {
 	}
 	if code := Run(context.Background(), []string{"write", "h", "/p", "--atomic"}, s, nil, strings.NewReader("data"), &out, &errout); code != 0 || string(f.atomicData) != "data" {
 		t.Fatalf("atomic write: %d %q", code, f.atomicData)
+	}
+	if code := run("read", "h", "/log", "--offset", "-6", "--limit=4"); code != 0 || out.String() != "slice" || f.rangeArgs != [2]int64{-6, 4} {
+		t.Fatalf("read range: %d %q %q %v", code, out.String(), errout.String(), f.rangeArgs)
+	}
+	if code := run("read", "h", "/log", "--offset", "x"); code != 1 {
+		t.Fatalf("bad offset accepted: %d", code)
 	}
 	if code := run("mkdir", "h", "/d"); code != 0 || !strings.Contains(out.String(), `"ok":true`) {
 		t.Fatalf("mkdir: %d %q", code, out.String())
@@ -164,6 +175,16 @@ func TestHostAddCommand(t *testing.T) {
 	}
 	if code := HostAdd([]string{"bad", "--user", "u"}, path, &out, &errout); code != 1 {
 		t.Fatal("missing address accepted")
+	}
+	if code := HostAdd([]string{"box", "--ssh-alias", "my-server", "--shell-backend=tmux", "--read"}, path, &out, &errout); code != 0 {
+		t.Fatalf("%d %q", code, errout.String())
+	}
+	c, err = config.Load(path)
+	if box := c.Hosts["box"]; err != nil || box.SSHAlias != "my-server" || box.ShellBackend != "tmux" || box.Port != 0 || box.Address != "" || !box.Policy.Read {
+		t.Fatalf("%v %+v", err, box)
+	}
+	if code := HostAdd([]string{"bad", "--ssh-alias", "x", "--shell-backend", "screen"}, path, &out, &errout); code != 1 {
+		t.Fatal("unknown shell backend accepted")
 	}
 }
 

@@ -18,16 +18,33 @@ func (t *Transport) files(ctx context.Context, h host.Host) (*sftp.Client, func(
 		// opened over a dialed SSH connection.
 		return t.newSFTPDial(ctx, h)
 	}
-	client, cleanup, err := t.connect(ctx, h)
+	if t.dialOverride != nil {
+		client, cleanup, err := t.connect(ctx, h)
+		if err != nil {
+			return nil, nil, err
+		}
+		fs, err := sftp.NewClient(client)
+		if err != nil {
+			cleanup()
+			return nil, nil, operationError(ctx, err)
+		}
+		return fs, func() { fs.Close(); cleanup() }, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, operationError(ctx, err)
+	}
+	// Pooled connections keep their SFTP session, so consecutive file
+	// operations (such as a root check and the read) share one subsystem.
+	res, release, err := t.claim(ctx, h)
 	if err != nil {
 		return nil, nil, err
 	}
-	fs, err := sftp.NewClient(client)
+	fs, err := res.sftpClient()
 	if err != nil {
-		cleanup()
+		release()
 		return nil, nil, operationError(ctx, err)
 	}
-	return fs, func() { fs.Close(); cleanup() }, nil
+	return fs, release, nil
 }
 func remotePath(fs *sftp.Client, p string) (string, error) {
 	if p == "" || strings.ContainsRune(p, 0) {
@@ -70,6 +87,44 @@ func (t *Transport) Read(ctx context.Context, h host.Host, p string) ([]byte, er
 		return nil, transport.ErrTooLarge
 	}
 	return data, nil
+}
+
+// ReadRange seeks within the file instead of loading it, so slices of files
+// larger than MaxReadSize can be read.
+func (t *Transport) ReadRange(ctx context.Context, h host.Host, p string, offset, limit int64) (transport.FileRange, error) {
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	fs, cleanup, err := t.files(ctx, h)
+	if err != nil {
+		return transport.FileRange{}, err
+	}
+	defer cleanup()
+	p, err = remotePath(fs, p)
+	if err != nil {
+		return transport.FileRange{}, operationError(ctx, err)
+	}
+	file, err := fs.Open(p)
+	if err != nil {
+		return transport.FileRange{}, operationError(ctx, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return transport.FileRange{}, operationError(ctx, err)
+	}
+	size := info.Size()
+	start := min(offset, size)
+	if offset < 0 {
+		start = max(size+offset, 0)
+	}
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return transport.FileRange{}, operationError(ctx, err)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, limit))
+	if err != nil {
+		return transport.FileRange{}, operationError(ctx, err)
+	}
+	return transport.FileRange{Data: data, Offset: start, Size: size}, nil
 }
 func (t *Transport) Write(ctx context.Context, h host.Host, p string, data []byte) error {
 	if len(data) > transport.MaxWriteSize {

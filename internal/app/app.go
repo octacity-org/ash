@@ -51,7 +51,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errout io.Writer
 	}
 	if args[0] == "host" {
 		if len(args) < 2 || args[1] != "add" {
-			return fail(fmt.Errorf("usage: ash [--config PATH] host add NAME --address ADDRESS --user USER"))
+			return fail(fmt.Errorf("usage: ash [--config PATH] host add NAME (--address ADDRESS --user USER | --ssh-alias ALIAS)"))
 		}
 		return cli.HostAdd(args[2:], path, out, errout)
 	}
@@ -89,7 +89,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errout io.Writer
 	defer t.Close()
 	hosts := host.New(c.Hosts)
 	s := service.New(hosts, t)
-	shells := service.NewShellsWithBackends(hosts, zellij.New(t), tmux.New(t))
+	shells := service.NewShellsWithBackends(hosts, zellij.New(t), tmux.New(t)).WithCanonicalizer(t)
 	if args[0] == "doctor" {
 		return cli.Doctor(ctx, args[1:], doctor.New(hosts, t, filepath.Join(home, ".ssh", "known_hosts")), out, errout)
 	}

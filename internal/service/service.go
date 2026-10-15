@@ -29,11 +29,23 @@ func (s *Service) WithAudit(recorder *audit.Recorder) *Service {
 	return s
 }
 
+// HostInfo describes a host and the policy limits an agent will meet, so it
+// can plan within them instead of discovering them through refusals.
 type HostInfo struct {
 	Name         string   `json:"name"`
 	Address      string   `json:"address"`
 	User         string   `json:"user"`
 	Capabilities []string `json:"capabilities"`
+	ShellBackend string   `json:"shell_backend,omitempty"`
+
+	ReadRoots         []string `json:"read_roots,omitempty"`
+	WriteRoots        []string `json:"write_roots,omitempty"`
+	CwdRoots          []string `json:"cwd_roots,omitempty"`
+	AllowedCommands   []string `json:"allowed_commands,omitempty"`
+	AllowShell        bool     `json:"allow_shell,omitempty"`
+	MaxTimeoutSeconds int      `json:"max_timeout_seconds,omitempty"`
+	MaxInputBytes     int64    `json:"max_input_bytes,omitempty"`
+	MaxOutputBytes    int64    `json:"max_output_bytes,omitempty"`
 }
 
 func (s *Service) Hosts() []HostInfo {
@@ -49,7 +61,13 @@ func (s *Service) Hosts() []HostInfo {
 		if h.Policy.Write {
 			caps = append(caps, "write")
 		}
-		out = append(out, HostInfo{Name: h.Name, Address: h.Address, User: h.User, Capabilities: caps})
+		p := h.Policy
+		out = append(out, HostInfo{
+			Name: h.Name, Address: h.Address, User: h.User, Capabilities: caps, ShellBackend: h.ShellBackend,
+			ReadRoots: p.ReadRoots, WriteRoots: p.WriteRoots, CwdRoots: p.CwdRoots,
+			AllowedCommands: p.AllowedCommands, AllowShell: p.AllowShell,
+			MaxTimeoutSeconds: p.MaxTimeoutSeconds, MaxInputBytes: p.MaxInputBytes, MaxOutputBytes: p.MaxOutputBytes,
+		})
 	}
 	return out
 }
@@ -74,11 +92,27 @@ func (s *Service) authorize(name, operation string) (host.Host, error) {
 	return h, err
 }
 
-func (s *Service) finish(operation, name string, started time.Time, err error) {
+// usage is the payload an operation moved: in is sent to the remote host
+// (stdin, written content), out is returned from it (output, read content).
+type usage struct {
+	in, out   int
+	truncated bool
+}
+
+func treeBytes(entries []transport.TreeEntry) int {
+	n := 0
+	for _, entry := range entries {
+		n += len(entry.Data)
+	}
+	return n
+}
+
+func (s *Service) finish(operation, name string, started time.Time, err error, u usage) {
 	if s.audit == nil {
 		return
 	}
-	record := audit.Record{Operation: operation, Host: name, Decision: audit.Allowed, Result: audit.ResultOK, DurationMS: time.Since(started).Milliseconds()}
+	record := audit.Record{Operation: operation, Host: name, Decision: audit.Allowed, Result: audit.ResultOK, DurationMS: time.Since(started).Milliseconds(),
+		BytesIn: int64(u.in), BytesOut: int64(u.out), Truncated: u.truncated}
 	if err != nil {
 		record.Result = audit.ResultError
 		if errors.Is(err, transport.ErrTimeout) {
@@ -89,7 +123,7 @@ func (s *Service) finish(operation, name string, started time.Time, err error) {
 }
 
 func (s *Service) fail(operation, name string, started time.Time, err error) error {
-	s.finish(operation, name, started, err)
+	s.finish(operation, name, started, err, usage{})
 	return err
 }
 
@@ -129,7 +163,7 @@ func (s *Service) Exec(ctx context.Context, req transport.ExecRequest) (transpor
 		return transport.ExecResult{}, err
 	}
 	result, err := s.exec(ctx, h, req)
-	s.finish("exec", req.Host, started, err)
+	s.finish("exec", req.Host, started, err, usage{in: len(req.Stdin), out: len(result.Stdout) + len(result.Stderr), truncated: result.StdoutTruncated || result.StderrTruncated})
 	return result, err
 }
 
@@ -207,8 +241,39 @@ func (s *Service) Read(ctx context.Context, name, path string) ([]byte, error) {
 	}
 	data, err := s.transport.Read(ctx, h, path)
 	err = operationError(ctx, name, "read", err)
-	s.finish("read", name, started, err)
+	s.finish("read", name, started, err, usage{out: len(data)})
 	return data, err
+}
+
+// ReadRange reads a bounded slice of a file. A zero limit means MaxReadSize;
+// a negative offset counts back from the end of the file.
+func (s *Service) ReadRange(ctx context.Context, name, path string, offset, limit int64) (transport.FileRange, error) {
+	started := time.Now()
+	h, err := s.authorize(name, "read")
+	if err != nil {
+		return transport.FileRange{}, err
+	}
+	if path == "" {
+		return transport.FileRange{}, s.fail("read", name, started, fmt.Errorf("path must not be empty"))
+	}
+	if limit < 0 || limit > transport.MaxReadSize {
+		return transport.FileRange{}, s.fail("read", name, started, fmt.Errorf("limit must be between 0 and %d", transport.MaxReadSize))
+	}
+	if limit == 0 {
+		limit = transport.MaxReadSize
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return transport.FileRange{}, s.fail("read", name, started, operationError(ctx, name, "read", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "read", path, false); err != nil {
+		return transport.FileRange{}, s.fail("read", name, started, err)
+	}
+	r, err := s.transport.ReadRange(ctx, h, path, offset, limit)
+	err = operationError(ctx, name, "read", err)
+	s.finish("read", name, started, err, usage{out: len(r.Data)})
+	return r, err
 }
 
 func (s *Service) Write(ctx context.Context, name, path string, data []byte) error {
@@ -232,7 +297,7 @@ func (s *Service) Write(ctx context.Context, name, path string, data []byte) err
 		return s.fail("write", name, started, err)
 	}
 	err = operationError(ctx, name, "write", s.transport.Write(ctx, h, path, data))
-	s.finish("write", name, started, err)
+	s.finish("write", name, started, err, usage{in: len(data)})
 	return err
 }
 
@@ -255,7 +320,7 @@ func (s *Service) Stat(ctx context.Context, name, path string) (transport.FileIn
 	}
 	result, err := s.transport.Stat(ctx, h, path)
 	err = operationError(ctx, name, "stat", err)
-	s.finish("stat", name, started, err)
+	s.finish("stat", name, started, err, usage{})
 	return result, err
 }
 
@@ -278,7 +343,7 @@ func (s *Service) List(ctx context.Context, name, p string) ([]transport.DirEntr
 	}
 	entries, err := s.transport.List(ctx, h, p)
 	err = operationError(ctx, name, "list", err)
-	s.finish("list", name, started, err)
+	s.finish("list", name, started, err, usage{})
 	return entries, err
 }
 
@@ -300,7 +365,7 @@ func (s *Service) Mkdir(ctx context.Context, name, p string) error {
 		return s.fail("mkdir", name, started, err)
 	}
 	err = operationError(ctx, name, "mkdir", s.transport.Mkdir(ctx, h, p))
-	s.finish("mkdir", name, started, err)
+	s.finish("mkdir", name, started, err, usage{})
 	return err
 }
 
@@ -325,7 +390,7 @@ func (s *Service) Rename(ctx context.Context, name, from, to string) error {
 		return s.fail("rename", name, started, err)
 	}
 	err = operationError(ctx, name, "rename", s.transport.Rename(ctx, h, from, to))
-	s.finish("rename", name, started, err)
+	s.finish("rename", name, started, err, usage{})
 	return err
 }
 
@@ -347,7 +412,7 @@ func (s *Service) Remove(ctx context.Context, name, p string) error {
 		return s.fail("remove", name, started, err)
 	}
 	err = operationError(ctx, name, "remove", s.transport.Remove(ctx, h, p))
-	s.finish("remove", name, started, err)
+	s.finish("remove", name, started, err, usage{})
 	return err
 }
 
@@ -373,7 +438,7 @@ func (s *Service) AtomicWrite(ctx context.Context, name, p string, data []byte) 
 		return s.fail("write atomic", name, started, err)
 	}
 	err = operationError(ctx, name, "write atomic", s.transport.AtomicWrite(ctx, h, p, data))
-	s.finish("write atomic", name, started, err)
+	s.finish("write atomic", name, started, err, usage{in: len(data)})
 	return err
 }
 
@@ -397,7 +462,7 @@ func (s *Service) ReadTree(ctx context.Context, name, p string) ([]transport.Tre
 	}
 	entries, err := s.transport.ReadTree(ctx, h, p)
 	err = operationError(ctx, name, "download", err)
-	s.finish("download", name, started, err)
+	s.finish("download", name, started, err, usage{out: treeBytes(entries)})
 	return entries, err
 }
 
@@ -420,7 +485,7 @@ func (s *Service) WriteTree(ctx context.Context, name, p string, entries []trans
 		return s.fail("upload", name, started, err)
 	}
 	err = operationError(ctx, name, "upload", s.transport.WriteTree(ctx, h, p, entries))
-	s.finish("upload", name, started, err)
+	s.finish("upload", name, started, err, usage{in: treeBytes(entries)})
 	return err
 }
 
@@ -430,6 +495,30 @@ func Text(data []byte) (string, error) {
 		return "", fmt.Errorf("file is not UTF-8 text; binary MCP reads are unsupported")
 	}
 	return string(data), nil
+}
+
+// TextRange decodes a slice cut at arbitrary byte offsets. It drops a partial
+// UTF-8 character at either edge and returns the adjusted start offset, so the
+// next slice can begin at offset+len(text) without losing bytes.
+func TextRange(r transport.FileRange) (string, int64, error) {
+	data, offset := r.Data, r.Offset
+	if offset > 0 {
+		for i := 0; i < utf8.UTFMax-1 && len(data) > 0 && !utf8.RuneStart(data[0]); i++ {
+			data, offset = data[1:], offset+1
+		}
+	}
+	if r.Offset+int64(len(r.Data)) < r.Size {
+		for i := 1; i <= utf8.UTFMax && i <= len(data); i++ {
+			if utf8.RuneStart(data[len(data)-i]) {
+				if !utf8.FullRune(data[len(data)-i:]) {
+					data = data[:len(data)-i]
+				}
+				break
+			}
+		}
+	}
+	text, err := Text(data)
+	return text, offset, err
 }
 
 // TimeoutMillis validates a wire timeout before converting it to a duration.
