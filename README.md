@@ -16,7 +16,7 @@ It requires `curl`, `tar`, and either `sha256sum` or `shasum`; Go is not require
 Run the same command again to update. To select a release or installation directory:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/octacity-org/ash/main/install.sh | ASH_VERSION=v0.2.0 ASH_INSTALL_DIR="$HOME/bin" sh
+curl -fsSL https://raw.githubusercontent.com/octacity-org/ash/main/install.sh | ASH_VERSION=v0.3.0 ASH_INSTALL_DIR="$HOME/bin" sh
 ```
 
 These URLs work after the installer is pushed to `main` and a matching release is
@@ -294,7 +294,7 @@ These opt-in tests create and clean up their own remote ASH sessions. They cover
 
 The two tests that execute a POSIX shell locally run on Unix runners. Configured-host Zellij tests and the opt-in local OpenSSH daemon fixture retain their explicit opt-in settings; the standard CI run needs no SSH credentials.
 
-Pushing a tag such as `v0.2.0` or `v0.2.0-rc.1` builds four native release archives. Unix targets use `.tar.gz`; Windows uses `.zip`. Each contains the executable, this README, and dependency/Go license notices. A release-wide `SHA256SUMS.txt` covers exactly those four archives.
+Pushing a tag such as `v0.3.0` or `v0.3.0-rc.1` builds four native release archives. Unix targets use `.tar.gz`; Windows uses `.zip`. Each contains the executable, this README, and dependency/Go license notices. A release-wide `SHA256SUMS.txt` covers exactly those four archives.
 
 The release job waits for every platform to succeed, creates or resumes a draft GitHub release, uploads all assets, then publishes it. Tags with a prerelease suffix are marked as prereleases. Already-published releases are not overwritten. Release publishing uses the workflow's GitHub token with `contents: write`; build jobs have read-only permissions.
 
@@ -302,7 +302,7 @@ Release builds stamp the same version into `ash --version` and MCP server metada
 
 ```sh
 python3 -m unittest discover -s scripts -p 'test_*.py' -v
-python3 scripts/release.py version v0.2.0-rc.1
+python3 scripts/release.py version v0.3.0-rc.1
 ```
 
 The workflow becomes active once this project is pushed to GitHub. Tagging and publishing are separate from implementing these workflow files.
