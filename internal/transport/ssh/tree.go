@@ -293,7 +293,7 @@ func (t *Transport) ReadTree(ctx context.Context, h host.Host, root string) ([]t
 				if total > transport.MaxTreePayload {
 					return nil, fmt.Errorf("tree exceeds %d byte payload", transport.MaxTreePayload)
 				}
-				entries = append(entries, transport.TreeEntry{Path: relative, Mode: mode.String(), Data: data})
+				entries = append(entries, transport.TreeEntry{Path: relative, Mode: mode.String(), Data: data, Perm: mode.Perm()})
 			}
 			if len(entries) > transport.MaxTreeEntries {
 				return nil, fmt.Errorf("tree exceeds %d entries", transport.MaxTreeEntries)
@@ -358,7 +358,11 @@ func (t *Transport) WriteTree(ctx context.Context, h host.Host, root string, ent
 			f.Close()
 			return operationError(ctx, err)
 		}
-		if err := f.Chmod(0644); err != nil {
+		perm := file.Perm
+		if perm == 0 {
+			perm = 0644
+		}
+		if err := f.Chmod(perm); err != nil {
 			f.Close()
 			return operationError(ctx, err)
 		}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -177,5 +178,38 @@ func TestDownloadRefusesSymlinkedAncestorOfNewRoot(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outside, "secret.txt")); !os.IsNotExist(err) {
 		t.Fatalf("file escaped the download root: %v", err)
+	}
+}
+
+// Downloads apply the remote permission bits, and uploads send the local
+// ones, so executable scripts survive a round trip.
+func TestTreeTransfersKeepPermissionBits(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits")
+	}
+	local := t.TempDir()
+	f := &fileTransport{readTree: []transport.TreeEntry{
+		{Path: "run.sh", Data: []byte("#!/bin/sh\n"), Perm: 0o755},
+		{Path: "secret", Data: []byte("s"), Perm: 0o600},
+		{Path: "plain", Data: []byte("p")},
+	}}
+	s := service.New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Read: true, Write: true}}}), f)
+	if err := runDownload(context.Background(), []string{"h", "/remote", local}, s); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]os.FileMode{"run.sh": 0o755, "secret": 0o600, "plain": 0o644}
+	for name, mode := range want {
+		info, err := os.Stat(filepath.Join(local, name))
+		if err != nil || info.Mode().Perm() != mode {
+			t.Fatalf("%s downloaded as %v, want %v (%v)", name, info.Mode().Perm(), mode, err)
+		}
+	}
+	if err := runUpload(context.Background(), []string{"h", local, "/remote"}, s); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range f.writeTree {
+		if entry.Perm != want[entry.Path] {
+			t.Fatalf("%s uploaded as %v, want %v", entry.Path, entry.Perm, want[entry.Path])
+		}
 	}
 }

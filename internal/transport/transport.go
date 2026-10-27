@@ -5,6 +5,7 @@ import (
 	"ash/internal/host"
 	"context"
 	"errors"
+	"os"
 	"time"
 )
 
@@ -78,6 +79,9 @@ type TreeEntry struct {
 	Mode  string `json:"mode,omitempty"`
 	IsDir bool   `json:"is_dir"`
 	Data  []byte `json:"data,omitempty"`
+	// Perm holds a file's permission bits (within 0777) to apply when the
+	// entry is written; zero means the 0644 default.
+	Perm os.FileMode `json:"-"`
 }
 
 // FileRange is a bounded slice of a remote file. Offset is the absolute
