@@ -71,6 +71,19 @@ type fileTransport struct {
 	writeRoot  string
 	writeTree  []transport.TreeEntry
 	rangeArgs  [2]int64
+	readData   []byte
+	streamed   []byte
+	atomic     bool
+}
+
+func (f *fileTransport) ReadStream(_ context.Context, _ host.Host, _ string, w io.Writer) error {
+	_, err := w.Write(f.readData)
+	return err
+}
+func (f *fileTransport) WriteStream(_ context.Context, _ host.Host, _ string, r io.Reader, atomic bool) error {
+	data, err := io.ReadAll(r)
+	f.streamed, f.atomic = data, atomic
+	return err
 }
 
 func (f *fileTransport) List(context.Context, host.Host, string) ([]transport.DirEntry, error) {
@@ -108,8 +121,16 @@ func TestFileCLIOperations(t *testing.T) {
 	if code := run("list", "h", "/d"); code != 0 || !strings.Contains(out.String(), `"name":"a"`) {
 		t.Fatalf("list: %d %q %q", code, out.String(), errout.String())
 	}
-	if code := Run(context.Background(), []string{"write", "h", "/p", "--atomic"}, s, nil, strings.NewReader("data"), &out, &errout); code != 0 || string(f.atomicData) != "data" {
-		t.Fatalf("atomic write: %d %q", code, f.atomicData)
+	if code := Run(context.Background(), []string{"write", "h", "/p", "--atomic"}, s, nil, strings.NewReader("data"), &out, &errout); code != 0 || string(f.streamed) != "data" || !f.atomic {
+		t.Fatalf("atomic write: %d %q %v", code, f.streamed, f.atomic)
+	}
+	large := strings.Repeat("w", transport.MaxWriteSize+1)
+	if code := Run(context.Background(), []string{"write", "h", "/p"}, s, nil, strings.NewReader(large), &out, &errout); code != 0 || len(f.streamed) != len(large) || f.atomic {
+		t.Fatalf("large write: %d %d %v %q", code, len(f.streamed), f.atomic, errout.String())
+	}
+	f.readData = []byte(large)
+	if code := run("read", "h", "/big"); code != 0 || out.Len() != len(large) {
+		t.Fatalf("large read: %d %d %q", code, out.Len(), errout.String())
 	}
 	if code := run("read", "h", "/log", "--offset", "-6", "--limit=4"); code != 0 || out.String() != "slice" || f.rangeArgs != [2]int64{-6, 4} {
 		t.Fatalf("read range: %d %q %q %v", code, out.String(), errout.String(), f.rangeArgs)
@@ -252,7 +273,8 @@ func TestWriteCancellationInterruptsStdin(t *testing.T) {
 	defer writer.Close()
 	var out, errout bytes.Buffer
 	done := make(chan int, 1)
-	go func() { done <- Run(ctx, []string{"write", "h", "/x"}, nil, nil, reader, &out, &errout) }()
+	s := service.New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Write: true}}}), new(fileTransport))
+	go func() { done <- Run(ctx, []string{"write", "h", "/x"}, s, nil, reader, &out, &errout) }()
 	cancel()
 	select {
 	case code := <-done:

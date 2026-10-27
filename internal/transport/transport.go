@@ -112,6 +112,12 @@ type Transport interface {
 	// offset counts back from the end of the file.
 	ReadRange(ctx context.Context, h host.Host, p string, offset, limit int64) (FileRange, error)
 	Write(context.Context, host.Host, string, []byte) error
+	// ReadStream copies a whole file to w and WriteStream creates or
+	// truncates a file from r, both without the in-memory size limits. With
+	// atomic set, WriteStream replaces the file like AtomicWrite. Cancelling
+	// the context stops the transfer.
+	ReadStream(ctx context.Context, h host.Host, p string, w io.Writer) error
+	WriteStream(ctx context.Context, h host.Host, p string, r io.Reader, atomic bool) error
 	Stat(context.Context, host.Host, string) (FileInfo, error)
 	Canonicalize(context.Context, host.Host, string) (string, error)
 	List(context.Context, host.Host, string) ([]DirEntry, error)

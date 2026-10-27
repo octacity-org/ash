@@ -24,7 +24,8 @@ func encodeOK(out io.Writer, fail func(error) int) int {
 	return 0
 }
 
-// runRead writes a whole file, or a slice when --offset or --limit is given.
+// runRead streams a whole file, or writes a slice when --offset or --limit is
+// given.
 func runRead(ctx context.Context, args []string, s *service.Service, out io.Writer) error {
 	if len(args) < 2 {
 		return fmt.Errorf("read requires HOST PATH [--offset N] [--limit N]")
@@ -54,20 +55,14 @@ func runRead(ctx context.Context, args []string, s *service.Service, out io.Writ
 		}
 		ranged = true
 	}
-	var data []byte
-	if ranged {
-		r, err := s.ReadRange(ctx, args[0], args[1], offset, limit)
-		if err != nil {
-			return err
-		}
-		data = r.Data
-	} else {
-		var err error
-		if data, err = s.Read(ctx, args[0], args[1]); err != nil {
-			return err
-		}
+	if !ranged {
+		return s.ReadStream(ctx, args[0], args[1], out)
 	}
-	_, err := out.Write(data)
+	r, err := s.ReadRange(ctx, args[0], args[1], offset, limit)
+	if err != nil {
+		return err
+	}
+	_, err = out.Write(r.Data)
 	return err
 }
 
@@ -82,14 +77,7 @@ func runWrite(ctx context.Context, args []string, s *service.Service, in io.Read
 		}
 		atomic = true
 	}
-	data, err := readInput(ctx, in, transport.MaxWriteSize)
-	if err != nil {
-		return err
-	}
-	if atomic {
-		return s.AtomicWrite(ctx, args[0], args[1], data)
-	}
-	return s.Write(ctx, args[0], args[1], data)
+	return s.WriteStream(ctx, args[0], args[1], in, atomic)
 }
 
 // runDownload maps a bounded remote tree onto a local directory. It never

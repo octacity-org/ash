@@ -187,3 +187,114 @@ func TestExecStreamAuditsMovedBytes(t *testing.T) {
 		t.Fatalf("record 1 = %+v", g)
 	}
 }
+
+// fileStreamTransport serves ReadStream from data and copies WriteStream input
+// into written.
+type fileStreamTransport struct {
+	transport.Transport
+	canonical map[string]string
+	data      []byte
+	written   []byte
+	atomic    bool
+	calls     int
+}
+
+func (f *fileStreamTransport) Canonicalize(_ context.Context, _ host.Host, p string) (string, error) {
+	if c, ok := f.canonical[p]; ok {
+		return c, nil
+	}
+	return p, nil
+}
+
+func (f *fileStreamTransport) ReadStream(_ context.Context, _ host.Host, _ string, w io.Writer) error {
+	f.calls++
+	_, err := w.Write(f.data)
+	return err
+}
+
+func (f *fileStreamTransport) WriteStream(_ context.Context, _ host.Host, _ string, r io.Reader, atomic bool) error {
+	f.calls++
+	f.atomic = atomic
+	data, err := io.ReadAll(r)
+	f.written = data
+	return err
+}
+
+func TestFileStreamsEnforceRootsAndCapability(t *testing.T) {
+	ctx := context.Background()
+	f := &fileStreamTransport{canonical: map[string]string{"/etc/passwd": "/etc/passwd"}}
+	s := New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Read: true, Write: true, ReadRoots: []string{"/srv"}, WriteRoots: []string{"/srv"}}}, "ro": {Policy: policy.Policy{Read: true}}}), f)
+	if err := s.ReadStream(ctx, "h", "/etc/passwd", io.Discard); !errors.Is(err, policy.ErrPermissionDenied) {
+		t.Fatalf("read root: %v", err)
+	}
+	if err := s.WriteStream(ctx, "h", "/etc/passwd", strings.NewReader("x"), true); !errors.Is(err, policy.ErrPermissionDenied) {
+		t.Fatalf("write root: %v", err)
+	}
+	if err := s.WriteStream(ctx, "ro", "/srv/x", strings.NewReader("x"), false); !errors.Is(err, policy.ErrPermissionDenied) {
+		t.Fatalf("write capability: %v", err)
+	}
+	if f.calls != 0 {
+		t.Fatalf("refused transfers reached transport %d times", f.calls)
+	}
+}
+
+func TestFileStreamsMoveLargeFilesWithinByteLimit(t *testing.T) {
+	ctx := context.Background()
+	large := bytes.Repeat([]byte("f"), transport.MaxWriteSize+1)
+	f := &fileStreamTransport{data: large}
+	s := New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Read: true, Write: true}}, "capped": {Policy: policy.Policy{Read: true, Write: true, MaxStreamBytes: 1024}}}), f)
+	if err := s.WriteStream(ctx, "h", "/srv/big", bytes.NewReader(large), true); err != nil || !bytes.Equal(f.written, large) || !f.atomic {
+		t.Fatalf("write: %v (%d bytes, atomic %v)", err, len(f.written), f.atomic)
+	}
+	var out bytes.Buffer
+	if err := s.ReadStream(ctx, "h", "/srv/big", &out); err != nil || out.Len() != len(large) {
+		t.Fatalf("read: %v (%d bytes)", err, out.Len())
+	}
+	if err := s.WriteStream(ctx, "capped", "/srv/big", bytes.NewReader(large), false); !errors.Is(err, policy.ErrPermissionDenied) {
+		t.Fatalf("capped write: %v", err)
+	}
+	out.Reset()
+	if err := s.ReadStream(ctx, "capped", "/srv/big", &out); !errors.Is(err, policy.ErrPermissionDenied) || out.Len() != 0 {
+		t.Fatalf("capped read: %v (%d bytes)", err, out.Len())
+	}
+}
+
+func TestWriteStreamStopsOnIdleInput(t *testing.T) {
+	previous := fileStreamTimeout
+	fileStreamTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { fileStreamTimeout = previous })
+	s := New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Write: true}}}), new(fileStreamTransport))
+	stdin, writer := io.Pipe()
+	t.Cleanup(func() { writer.Close() })
+	go writer.Write([]byte("partial"))
+	done := make(chan error, 1)
+	go func() { done <- s.WriteStream(context.Background(), "h", "/x", stdin, false) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, transport.ErrTimeout) {
+			t.Fatalf("%v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("idle input kept the write open")
+	}
+}
+
+func TestFileStreamsAuditBytes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	recorder, err := audit.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Read: true, Write: true}}}), &fileStreamTransport{data: []byte("12345")}).WithAudit(recorder)
+	ctx := context.Background()
+	if err := s.ReadStream(ctx, "h", "/x", io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteStream(ctx, "h", "/x", strings.NewReader("abc"), true); err != nil {
+		t.Fatal(err)
+	}
+	got := auditRecords(t, path)
+	if len(got) != 2 || got[0].Operation != "read" || got[0].BytesOut != 5 || got[1].Operation != "write atomic" || got[1].BytesIn != 3 {
+		t.Fatalf("records: %+v", got)
+	}
+}

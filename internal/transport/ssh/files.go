@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
 )
 
 func (t *Transport) files(ctx context.Context, h host.Host) (*sftp.Client, func(), error) {
@@ -46,6 +47,45 @@ func (t *Transport) files(ctx context.Context, h host.Host) (*sftp.Client, func(
 	}
 	return fs, release, nil
 }
+
+// streamCloseGrace is how long a cancelled streamed transfer may keep its
+// SFTP session to clean up, such as removing an atomic temporary file, before
+// the session is closed under it.
+const streamCloseGrace = 5 * time.Second
+
+// streamFiles opens an SFTP session for one streamed transfer. Unlike the
+// pooled session, it is closed when the context ends and the transfer has not
+// finished within streamCloseGrace, which unblocks a stalled request.
+func (t *Transport) streamFiles(ctx context.Context, h host.Host) (*sftp.Client, func(), error) {
+	var fs *sftp.Client
+	var cleanup func()
+	if t.newSFTPDial != nil {
+		var err error
+		if fs, cleanup, err = t.newSFTPDial(ctx, h); err != nil {
+			return nil, nil, err
+		}
+	} else {
+		client, release, err := t.connect(ctx, h)
+		if err != nil {
+			return nil, nil, err
+		}
+		if fs, err = sftp.NewClient(client); err != nil {
+			release()
+			return nil, nil, operationError(ctx, err)
+		}
+		cleanup = func() { fs.Close(); release() }
+	}
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		select {
+		case <-done:
+		case <-time.After(streamCloseGrace):
+			fs.Close()
+		}
+	})
+	return fs, func() { close(done); stop(); cleanup() }, nil
+}
+
 func remotePath(fs *sftp.Client, p string) (string, error) {
 	if p == "" || strings.ContainsRune(p, 0) {
 		return "", fmt.Errorf("path must be nonempty and contain no NUL")
@@ -152,6 +192,55 @@ func (t *Transport) Write(ctx context.Context, h host.Host, p string, data []byt
 	}
 	return operationError(ctx, closeErr)
 }
+
+// ReadStream copies a whole remote file to w without a size limit.
+func (t *Transport) ReadStream(ctx context.Context, h host.Host, p string, w io.Writer) error {
+	fs, cleanup, err := t.streamFiles(ctx, h)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	p, err = remotePath(fs, p)
+	if err != nil {
+		return operationError(ctx, err)
+	}
+	file, err := fs.Open(p)
+	if err != nil {
+		return operationError(ctx, err)
+	}
+	defer file.Close()
+	_, err = io.Copy(w, file)
+	return operationError(ctx, err)
+}
+
+// WriteStream creates or truncates a remote file from r without a size
+// limit. A failed plain write may leave a partial file; an atomic one leaves
+// the destination untouched.
+func (t *Transport) WriteStream(ctx context.Context, h host.Host, p string, r io.Reader, atomic bool) error {
+	fs, cleanup, err := t.streamFiles(ctx, h)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	p, err = remotePath(fs, p)
+	if err != nil {
+		return operationError(ctx, err)
+	}
+	if atomic {
+		return operationError(ctx, atomicWriteSFTP(clientDialer{fs}, p, r))
+	}
+	file, err := fs.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	if err != nil {
+		return operationError(ctx, err)
+	}
+	_, copyErr := io.Copy(file, r)
+	closeErr := file.Close()
+	if copyErr != nil {
+		return operationError(ctx, copyErr)
+	}
+	return operationError(ctx, closeErr)
+}
+
 func (t *Transport) Stat(ctx context.Context, h host.Host, p string) (transport.FileInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
 	defer cancel()
