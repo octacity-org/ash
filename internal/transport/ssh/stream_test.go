@@ -7,8 +7,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,5 +142,76 @@ func TestExecStreamCancellationClosesSession(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 5*time.Second {
 		t.Fatalf("cancellation took %s", elapsed)
+	}
+}
+
+func TestFileStreamsMoveFilesLargerThanReadLimit(t *testing.T) {
+	f := newSFTPFixture(t)
+	ctx := context.Background()
+	data := bytes.Repeat([]byte("streamed-file\n"), (transport.MaxWriteSize/14)+1000)
+	for _, atomic := range []bool{false, true} {
+		target := "large.bin"
+		if atomic {
+			target = "large-atomic.bin"
+		}
+		if err := f.tr.WriteStream(ctx, f.h, target, bytes.NewBuffer(data), atomic); err != nil {
+			t.Fatalf("atomic=%v: %v", atomic, err)
+		}
+		var out bytes.Buffer
+		if err := f.tr.ReadStream(ctx, f.h, target, &out); err != nil || !bytes.Equal(out.Bytes(), data) {
+			t.Fatalf("atomic=%v: read %d of %d bytes: %v", atomic, out.Len(), len(data), err)
+		}
+	}
+}
+
+// failingReader yields some bytes, then runs fail and returns its error.
+type failingReader struct {
+	remaining int
+	fail      func() error
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, r.fail()
+	}
+	n := min(len(p), r.remaining)
+	r.remaining -= n
+	return n, nil
+}
+
+func TestAtomicWriteStreamFailureKeepsDestination(t *testing.T) {
+	f := newSFTPFixture(t)
+	target := "keep.txt"
+	if err := os.WriteFile(filepath.Join(f.root, target), []byte("previous"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	broken := errors.New("input failed")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cases := []struct {
+		name string
+		fail func() error
+	}{
+		{"input error", func() error { return broken }},
+		// A cancelled transfer still removes its temporary file, because the
+		// session stays open for streamCloseGrace.
+		{"cancelled", func() error { cancel(); return context.Canceled }},
+	}
+	for _, c := range cases {
+		name := c.name
+		err := f.tr.WriteStream(ctx, f.h, target, &failingReader{remaining: 1 << 20, fail: c.fail}, true)
+		if err == nil {
+			t.Fatalf("%s: write succeeded", name)
+		}
+		data, readErr := os.ReadFile(filepath.Join(f.root, target))
+		if readErr != nil || string(data) != "previous" {
+			t.Fatalf("%s: destination = %q %v", name, data, readErr)
+		}
+		entries, _ := os.ReadDir(f.root)
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), ".ash-tmp-") {
+				t.Fatalf("%s: temporary file %s left behind", name, entry.Name())
+			}
+		}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"ash/internal/host"
 	"ash/internal/transport"
 	sshtransport "ash/internal/transport/ssh"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -235,6 +236,22 @@ func TestOpenSSH(t *testing.T) {
 				t.Fatalf("%s: %v %v", name, info, e)
 			}
 		}
+		big := filepath.Join(src, "big")
+		for _, flags := range [][]string{nil, {"--atomic"}} {
+			remote := filepath.Join(dir, "cli-write")
+			write := exec.Command(ash, append([]string{"--config", config, "write", "fixture", remote}, flags...)...)
+			input, _ := os.Open(big)
+			write.Stdin = input
+			if output, e := write.CombinedOutput(); e != nil {
+				t.Fatalf("write %v: %v: %s", flags, e, output)
+			}
+			input.Close()
+			read, e := exec.Command(ash, "--config", config, "read", "fixture", remote).Output()
+			want, _ := os.ReadFile(big)
+			if e != nil || !bytes.Equal(read, want) {
+				t.Fatalf("read back %d of %d bytes: %v", len(read), len(want), e)
+			}
+		}
 		code := exec.Command(ash, "--config", config, "exec", "fixture", "--stream", "--", "exit 5")
 		if e := code.Run(); code.ProcessState.ExitCode() != 5 {
 			t.Fatalf("exit code %d: %v", code.ProcessState.ExitCode(), e)
@@ -421,7 +438,7 @@ func buildCLI(t *testing.T, dir, address string, port int, username, identity st
 	os.WriteFile(filepath.Join(sshDir, "known_hosts"), []byte(knownhosts.Line([]string{address}, serverKey)+"\n"), 0600)
 	t.Setenv("HOME", dir)
 	config := filepath.Join(dir, "ash.toml")
-	body := fmt.Sprintf("[hosts.fixture]\naddress = \"127.0.0.1\"\nport = %d\nuser = %q\nidentity = %q\n\n[hosts.fixture.policy]\nexec = true\n", port, username, identity)
+	body := fmt.Sprintf("[hosts.fixture]\naddress = \"127.0.0.1\"\nport = %d\nuser = %q\nidentity = %q\n\n[hosts.fixture.policy]\nexec = true\nread = true\nwrite = true\n", port, username, identity)
 	if err := os.WriteFile(config, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}

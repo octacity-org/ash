@@ -3,6 +3,7 @@ package ssh
 import (
 	"ash/internal/host"
 	"ash/internal/transport"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -130,7 +131,7 @@ func (t *Transport) AtomicWrite(ctx context.Context, h host.Host, p string, data
 	if err != nil {
 		return operationError(ctx, err)
 	}
-	return operationError(ctx, atomicWriteSFTP(clientDialer{fs}, p, data))
+	return operationError(ctx, atomicWriteSFTP(clientDialer{fs}, p, bytes.NewReader(data)))
 }
 
 // sftpDialer abstracts the part of the SFTP client used by the atomic write,
@@ -164,10 +165,10 @@ func (c clientDialer) OpenFile(path string, f int) (sftpFile, error) {
 	return clientFile{file}, nil
 }
 
-// atomicWriteSFTP writes data to a same-directory temporary file and renames
-// it over p atomically, or leaves p untouched: the temp file is always
-// removed on failure, and the rename never deletes the destination first.
-func atomicWriteSFTP(fs sftpDialer, p string, data []byte) error {
+// atomicWriteSFTP copies r to a same-directory temporary file and renames it
+// over p atomically, or leaves p untouched: the temp file is always removed
+// on failure, and the rename never deletes the destination first.
+func atomicWriteSFTP(fs sftpDialer, p string, r io.Reader) error {
 	var random [8]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		return err
@@ -187,7 +188,7 @@ func atomicWriteSFTP(fs sftpDialer, p string, data []byte) error {
 		file.Close()
 		return err
 	}
-	if _, err := file.Write(data); err != nil {
+	if _, err := io.Copy(file, r); err != nil {
 		return closeWith(err)
 	}
 	if err := file.Sync(); err != nil && !isUnsupportedOperation(err) {

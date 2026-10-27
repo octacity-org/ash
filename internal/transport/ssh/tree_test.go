@@ -162,7 +162,7 @@ func TestAtomicWriteWithoutPosixRenameExtensionIsUnsupported(t *testing.T) {
 		destination: destination,
 		removed:     &removed,
 	}
-	err := atomicWriteSFTP(fs, destination, []byte("new bytes"))
+	err := atomicWriteSFTP(fs, destination, strings.NewReader("new bytes"))
 	if err == nil || !isUnsupportedOperation(err) || !strings.Contains(err.Error(), "posix-rename@openssh.com") {
 		t.Fatalf("expected clear unsupported error, got %v", err)
 	}
