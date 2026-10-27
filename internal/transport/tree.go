@@ -28,6 +28,9 @@ func ValidateTree(root string, entries []TreeEntry) error {
 			return fmt.Errorf("duplicate tree path %q", e.Path)
 		}
 		kinds[e.Path] = e.IsDir
+		if e.Perm&^0o777 != 0 {
+			return fmt.Errorf("tree path %q has unsupported mode %v", e.Path, e.Perm)
+		}
 		if e.IsDir {
 			if len(e.Data) != 0 {
 				return fmt.Errorf("directory %q must not carry data", e.Path)

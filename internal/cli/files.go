@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -130,6 +131,16 @@ func runDownload(ctx context.Context, args []string, s *service.Service) error {
 		if _, err := file.Write(entry.Data); err != nil {
 			file.Close()
 			return err
+		}
+		if runtime.GOOS != "windows" {
+			perm := entry.Perm
+			if perm == 0 {
+				perm = 0o644
+			}
+			if err := file.Chmod(perm); err != nil {
+				file.Close()
+				return err
+			}
 		}
 		if err := file.Close(); err != nil {
 			return err
@@ -288,7 +299,13 @@ func walkLocal(root string) ([]transport.TreeEntry, error) {
 				if total > transport.MaxTreePayload {
 					return nil, fmt.Errorf("upload exceeds %d byte payload", transport.MaxTreePayload)
 				}
-				entries = append(entries, transport.TreeEntry{Path: relative, Data: data})
+				entry := transport.TreeEntry{Path: relative, Data: data}
+				// Windows has no POSIX permission bits; its uploads keep the
+				// 0644 default.
+				if runtime.GOOS != "windows" {
+					entry.Perm = childInfo.Mode().Perm()
+				}
+				entries = append(entries, entry)
 			}
 			if len(entries) > transport.MaxTreeEntries {
 				return nil, fmt.Errorf("upload exceeds %d entries", transport.MaxTreeEntries)

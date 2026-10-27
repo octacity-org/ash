@@ -27,6 +27,7 @@ func TestValidateTreeRejectsUnsafe(t *testing.T) {
 		"duplicate":     {{Path: "a", IsDir: true}, {Path: "a", IsDir: true}},
 		"type conflict": {{Path: "a", Data: []byte("x")}, {Path: "a/b", Data: []byte("y")}},
 		"dir data":      {{Path: "a", IsDir: true, Data: []byte("x")}},
+		"setuid mode":   {{Path: "a", Data: []byte("x"), Perm: 0o4755}},
 	}
 	for name, entries := range cases {
 		if err := ValidateTree("/remote", entries); err == nil {

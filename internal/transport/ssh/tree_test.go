@@ -279,6 +279,40 @@ func TestAtomicWritePreservesExistingMode(t *testing.T) {
 	}
 }
 
+// Tree transfers carry permission bits both ways, so scripts stay executable;
+// entries without a mode keep the 0644 default.
+func TestTreeTransfersKeepPermissionBits(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits")
+	}
+	f := newSFTPFixture(t)
+	ctx := context.Background()
+	entries := []transport.TreeEntry{
+		{Path: "run.sh", Data: []byte("#!/bin/sh\n"), Perm: 0o755},
+		{Path: "secret", Data: []byte("s"), Perm: 0o600},
+		{Path: "plain", Data: []byte("p")},
+	}
+	if err := f.tr.WriteTree(ctx, f.h, "modes", entries); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]os.FileMode{"run.sh": 0o755, "secret": 0o600, "plain": 0o644}
+	for name, mode := range want {
+		info, err := os.Stat(filepath.Join(f.root, "modes", name))
+		if err != nil || info.Mode().Perm() != mode {
+			t.Fatalf("%s written as %v, want %v (%v)", name, info.Mode().Perm(), mode, err)
+		}
+	}
+	read, err := f.tr.ReadTree(ctx, f.h, "modes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range read {
+		if entry.Perm != want[entry.Path] {
+			t.Fatalf("%s read as %v, want %v", entry.Path, entry.Perm, want[entry.Path])
+		}
+	}
+}
+
 // Ranged reads seek instead of loading the whole file, so they work past the
 // whole-file read limit; a negative offset counts back from the end.
 func TestReadRangeSlicesAndTails(t *testing.T) {
