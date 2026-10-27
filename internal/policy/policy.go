@@ -39,6 +39,9 @@ type Policy struct {
 	MaxTimeoutSeconds int   `toml:"max_timeout_seconds,omitempty" json:"max_timeout_seconds,omitempty"`
 	MaxInputBytes     int64 `toml:"max_input_bytes,omitempty" json:"max_input_bytes,omitempty"`
 	MaxOutputBytes    int64 `toml:"max_output_bytes,omitempty" json:"max_output_bytes,omitempty"`
+	// MaxStreamBytes caps the bytes one streamed operation moves in both
+	// directions combined. Zero means unlimited.
+	MaxStreamBytes int64 `toml:"max_stream_bytes,omitempty" json:"max_stream_bytes,omitempty"`
 }
 
 func (p Policy) Check(operation string) error {
@@ -173,6 +176,9 @@ func (p Policy) Validate() error {
 	}
 	if p.MaxOutputBytes < 0 || p.MaxOutputBytes > HardMaxOutputBytes {
 		return fmt.Errorf("max_output_bytes must be between 0 and %d", HardMaxOutputBytes)
+	}
+	if p.MaxStreamBytes < 0 {
+		return fmt.Errorf("max_stream_bytes must not be negative")
 	}
 	return nil
 }

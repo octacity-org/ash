@@ -100,15 +100,17 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 	b.buffer.Write(p)
 	return n, nil
 }
+func execCommand(req transport.ExecRequest) (string, error) {
+	if len(req.Argv) > 0 {
+		return buildArgv(req)
+	}
+	return buildCommand(req)
+}
+
 func (t *Transport) Exec(ctx context.Context, h host.Host, req transport.ExecRequest) (result transport.ExecResult, err error) {
 	started := time.Now()
 	defer func() { result.Duration = time.Since(started) }()
-	var command string
-	if len(req.Argv) > 0 {
-		command, err = buildArgv(req)
-	} else {
-		command, err = buildCommand(req)
-	}
+	command, err := execCommand(req)
 	if err != nil {
 		return result, err
 	}
@@ -153,6 +155,11 @@ func (t *Transport) Exec(ctx context.Context, h host.Host, req transport.ExecReq
 	result.Stderr = stderr.String()
 	result.StdoutTruncated = stdout.truncated
 	result.StderrTruncated = stderr.truncated
+	return exitResult(ctx, result, err)
+}
+
+// exitResult turns a remote exit status into a result rather than an error.
+func exitResult(ctx context.Context, result transport.ExecResult, err error) (transport.ExecResult, error) {
 	if ctx.Err() != nil {
 		return result, operationError(ctx, err)
 	}
@@ -162,4 +169,36 @@ func (t *Transport) Exec(ctx context.Context, h host.Host, req transport.ExecReq
 		return result, nil
 	}
 	return result, err
+}
+
+// ExecStream runs a command with its standard streams connected to stdio. The
+// caller's context bounds the whole run; cancelling it closes the session.
+func (t *Transport) ExecStream(ctx context.Context, h host.Host, req transport.ExecRequest, stdio transport.Stdio) (result transport.ExecResult, err error) {
+	started := time.Now()
+	defer func() { result.Duration = time.Since(started) }()
+	command, err := execCommand(req)
+	if err != nil {
+		return result, err
+	}
+	client, cleanup, err := t.connect(ctx, h)
+	if err != nil {
+		return result, err
+	}
+	defer cleanup()
+	session, err := client.NewSession()
+	if err != nil {
+		return result, operationError(ctx, err)
+	}
+	defer session.Close()
+	session.Stdout = stdio.Stdout
+	session.Stderr = stdio.Stderr
+	// x/crypto closes its stdin pipe once the exit status arrives, so Run
+	// returns when the remote command exits even if local stdin stays open.
+	// Local EOF closes the remote stdin.
+	if stdio.Stdin != nil {
+		session.Stdin = stdio.Stdin
+	}
+	stop := context.AfterFunc(ctx, func() { session.Close() })
+	defer stop()
+	return exitResult(ctx, result, session.Run(command))
 }

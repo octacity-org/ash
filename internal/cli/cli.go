@@ -18,8 +18,9 @@ const Usage = `Usage:
   ash [--config PATH] hosts
 	ash [--config PATH] host add NAME (--address ADDRESS --user USER [--port N] [--identity PATH] | --ssh-alias ALIAS) [--shell-backend zellij|tmux] [--exec] [--read] [--write]
 	ash [--config PATH] doctor [HOST] [--json]
-	ash [--config PATH] exec HOST [--stdin] [--cwd PATH] [--env KEY=VALUE] [--timeout 30s] -- COMMAND...
-	ash [--config PATH] execv HOST [--stdin] [--cwd PATH] [--env KEY=VALUE] [--timeout 30s] -- PROGRAM ARG...
+	ash [--config PATH] exec HOST [--stdin|--stream] [--cwd PATH] [--env KEY=VALUE] [--timeout 30s] -- COMMAND...
+	ash [--config PATH] execv HOST [--stdin|--stream] [--cwd PATH] [--env KEY=VALUE] [--timeout 30s] -- PROGRAM ARG...
+  ash [--config PATH] rsh [-l USER] HOST COMMAND...
   ash [--config PATH] read HOST PATH [--offset N] [--limit N]
   ash [--config PATH] write HOST PATH [--atomic] < FILE
   ash [--config PATH] stat HOST PATH
@@ -43,6 +44,9 @@ execv runs PROGRAM with structured ARG words and strict quoting; no shell is inv
 Quote remote ~/ paths to prevent your local shell from expanding them.
 Read with --offset or --limit returns a slice of any file size; a negative offset counts from the end.
 With --stdin, ASH forwards up to 64 KiB from standard input to the command.
+With --stream, standard input, output and error flow to and from the command
+without size caps, and --timeout limits how long no data may move.
+rsh streams like exec --stream with the calling convention of rsync -e.
 Shell send reads stdin if INPUT is omitted. Include a newline to execute input.
 Shell read returns a terminal snapshot; pass --cursor from a previous --json read for output added since then.
 Shell wait blocks for new output or --until/--regex and never closes the shell on timeout.
@@ -69,7 +73,7 @@ func Run(ctx context.Context, args []string, s *service.Service, shells *service
 		}
 		return 0
 	case "exec", "execv":
-		var req transport.ExecRequest
+		var req execArgs
 		var err error
 		if args[0] == "execv" {
 			req, err = parseExecv(args[1:])
@@ -79,6 +83,12 @@ func Run(ctx context.Context, args []string, s *service.Service, shells *service
 		if err != nil {
 			return fail(err)
 		}
+		if req.stream {
+			if req.StdinSet {
+				return fail(fmt.Errorf("--stdin and --stream are mutually exclusive; --stream always forwards stdin"))
+			}
+			return runStream(ctx, s, req.ExecRequest, in, out, errout)
+		}
 		if req.StdinSet {
 			data, err := readInput(ctx, in, transport.MaxExecInputSize)
 			if err != nil {
@@ -86,7 +96,7 @@ func Run(ctx context.Context, args []string, s *service.Service, shells *service
 			}
 			req.Stdin = data
 		}
-		r, err := s.Exec(ctx, req)
+		r, err := s.Exec(ctx, req.ExecRequest)
 		if err != nil {
 			return fail(err)
 		}
@@ -102,10 +112,13 @@ func Run(ctx context.Context, args []string, s *service.Service, shells *service
 		if r.StderrTruncated {
 			fmt.Fprintln(errout, "\nash: stderr truncated at 8 MiB")
 		}
-		if r.ExitCode < 0 || r.ExitCode > 255 {
-			return 1
+		return exitStatus(r.ExitCode)
+	case "rsh":
+		req, err := parseRsh(args[1:], s)
+		if err != nil {
+			return fail(err)
 		}
-		return r.ExitCode
+		return runStream(ctx, s, req, in, out, errout)
 	case "read":
 		if err := runRead(ctx, args[1:], s, out); err != nil {
 			return fail(err)
@@ -177,7 +190,55 @@ func Run(ctx context.Context, args []string, s *service.Service, shells *service
 	}
 }
 
-func parseExecv(args []string) (transport.ExecRequest, error) {
+// exitStatus maps a remote exit code to a process exit status.
+func exitStatus(code int) int {
+	if code < 0 || code > 255 {
+		return 1
+	}
+	return code
+}
+
+// runStream connects local stdio to a remote command and returns its exit
+// status.
+func runStream(ctx context.Context, s *service.Service, req transport.ExecRequest, in io.Reader, out, errout io.Writer) int {
+	r, err := s.ExecStream(ctx, req, transport.Stdio{Stdin: in, Stdout: out, Stderr: errout})
+	if err != nil {
+		fmt.Fprintln(errout, "ash:", err)
+		return 1
+	}
+	return exitStatus(r.ExitCode)
+}
+
+// parseRsh accepts the rsh calling convention that rsync -e uses:
+// [-l USER] HOST COMMAND... Like ssh, it joins the command words with spaces
+// for the remote shell. -l must name the host's configured user, because ASH
+// connects only as that user.
+func parseRsh(args []string, s *service.Service) (transport.ExecRequest, error) {
+	user := ""
+	if len(args) >= 2 && args[0] == "-l" {
+		user, args = args[1], args[2:]
+	}
+	if len(args) < 2 {
+		return transport.ExecRequest{}, fmt.Errorf("rsh requires [-l USER] HOST COMMAND...")
+	}
+	req := transport.ExecRequest{Host: args[0], Command: strings.Join(args[1:], " ")}
+	if user != "" {
+		for _, h := range s.Hosts() {
+			if h.Name == req.Host && h.User != user {
+				return req, fmt.Errorf("host %q connects as %q, not %q", req.Host, h.User, user)
+			}
+		}
+	}
+	return req, nil
+}
+
+// execArgs is a parsed exec or execv command line.
+type execArgs struct {
+	transport.ExecRequest
+	stream bool
+}
+
+func parseExecv(args []string) (execArgs, error) {
 	req, err := parseExecFlags(args, "execv")
 	if err != nil {
 		return req, err
@@ -190,8 +251,8 @@ func parseExecv(args []string) (transport.ExecRequest, error) {
 	return req, nil
 }
 
-func parseExec(args []string) (transport.ExecRequest, error) {
-	var req transport.ExecRequest
+func parseExec(args []string) (execArgs, error) {
+	var req execArgs
 	if len(args) == 0 {
 		return req, fmt.Errorf("exec requires HOST [flags] -- COMMAND")
 	}
@@ -202,8 +263,8 @@ func parseExec(args []string) (transport.ExecRequest, error) {
 
 // parseExecFlags parses the option list shared by exec and execv. Shell code is
 // stored in Command; structured arguments are stored in Argv.
-func parseExecFlags(args []string, verb string) (transport.ExecRequest, error) {
-	var req transport.ExecRequest
+func parseExecFlags(args []string, verb string) (execArgs, error) {
+	var req execArgs
 	if len(args) == 0 {
 		return req, fmt.Errorf("%s requires HOST [flags] -- COMMAND", verb)
 	}
@@ -223,6 +284,10 @@ func parseExecFlags(args []string, verb string) (transport.ExecRequest, error) {
 		}
 		if args[i] == "--stdin" {
 			req.StdinSet = true
+			continue
+		}
+		if args[i] == "--stream" {
+			req.stream = true
 			continue
 		}
 		key, value, hasValue := strings.Cut(args[i], "=")

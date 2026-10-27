@@ -36,6 +36,7 @@ func TestValidateRootsAndBounds(t *testing.T) {
 		"timeout bound": {MaxTimeoutSeconds: HardMaxTimeoutSeconds + 1},
 		"input bound":   {MaxInputBytes: HardMaxInputBytes + 1},
 		"output bound":  {MaxOutputBytes: HardMaxOutputBytes + 1},
+		"stream bound":  {MaxStreamBytes: -1},
 		"empty command": {AllowedCommands: []string{""}},
 	} {
 		if err := p.Validate(); err == nil {

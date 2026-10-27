@@ -385,14 +385,14 @@ func TestAuditRecordsByteCountsAndTruncation(t *testing.T) {
 }
 
 func TestHostsExposePolicyBounds(t *testing.T) {
-	pol := policy.Policy{Exec: true, ReadRoots: []string{"/srv"}, CwdRoots: []string{"/work"}, AllowedCommands: []string{"git"}, AllowShell: true, MaxTimeoutSeconds: 60, MaxInputBytes: 1024, MaxOutputBytes: 2048}
+	pol := policy.Policy{Exec: true, ReadRoots: []string{"/srv"}, CwdRoots: []string{"/work"}, AllowedCommands: []string{"git"}, AllowShell: true, MaxTimeoutSeconds: 60, MaxInputBytes: 1024, MaxOutputBytes: 2048, MaxStreamBytes: 4096}
 	s := New(host.New(map[string]host.Host{"h": {Address: "a", User: "u", Identity: "secret", ShellBackend: "tmux", Policy: pol}, "plain": {Policy: policy.Policy{Read: true}}}), new(fakeTransport))
 	data, err := json.Marshal(s.Hosts())
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(data)
-	for _, want := range []string{`"read_roots":["/srv"]`, `"cwd_roots":["/work"]`, `"allowed_commands":["git"]`, `"allow_shell":true`, `"max_timeout_seconds":60`, `"max_input_bytes":1024`, `"max_output_bytes":2048`, `"shell_backend":"tmux"`} {
+	for _, want := range []string{`"read_roots":["/srv"]`, `"cwd_roots":["/work"]`, `"allowed_commands":["git"]`, `"allow_shell":true`, `"max_timeout_seconds":60`, `"max_input_bytes":1024`, `"max_output_bytes":2048`, `"max_stream_bytes":4096`, `"shell_backend":"tmux"`} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing %s in %s", want, text)
 		}
