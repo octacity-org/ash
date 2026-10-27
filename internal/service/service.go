@@ -47,6 +47,7 @@ type HostInfo struct {
 	MaxInputBytes     int64    `json:"max_input_bytes,omitempty"`
 	MaxOutputBytes    int64    `json:"max_output_bytes,omitempty"`
 	MaxStreamBytes    int64    `json:"max_stream_bytes,omitempty"`
+	ForwardTargets    []string `json:"forward_targets,omitempty"`
 }
 
 func (s *Service) Hosts() []HostInfo {
@@ -62,13 +63,16 @@ func (s *Service) Hosts() []HostInfo {
 		if h.Policy.Write {
 			caps = append(caps, "write")
 		}
+		if h.Policy.Forward {
+			caps = append(caps, "forward")
+		}
 		p := h.Policy
 		out = append(out, HostInfo{
 			Name: h.Name, Address: h.Address, User: h.User, Capabilities: caps, ShellBackend: h.ShellBackend,
 			ReadRoots: p.ReadRoots, WriteRoots: p.WriteRoots, CwdRoots: p.CwdRoots,
 			AllowedCommands: p.AllowedCommands, AllowShell: p.AllowShell,
 			MaxTimeoutSeconds: p.MaxTimeoutSeconds, MaxInputBytes: p.MaxInputBytes, MaxOutputBytes: p.MaxOutputBytes,
-			MaxStreamBytes: p.MaxStreamBytes,
+			MaxStreamBytes: p.MaxStreamBytes, ForwardTargets: p.ForwardTargets,
 		})
 	}
 	return out
@@ -99,6 +103,7 @@ func (s *Service) authorize(name, operation string) (host.Host, error) {
 type usage struct {
 	in, out   int
 	truncated bool
+	target    string
 }
 
 func treeBytes(entries []transport.TreeEntry) int {
@@ -114,7 +119,7 @@ func (s *Service) finish(operation, name string, started time.Time, err error, u
 		return
 	}
 	record := audit.Record{Operation: operation, Host: name, Decision: audit.Allowed, Result: audit.ResultOK, DurationMS: time.Since(started).Milliseconds(),
-		BytesIn: int64(u.in), BytesOut: int64(u.out), Truncated: u.truncated}
+		BytesIn: int64(u.in), BytesOut: int64(u.out), Truncated: u.truncated, Target: u.target}
 	if err != nil {
 		record.Result = audit.ResultError
 		if errors.Is(err, transport.ErrTimeout) {

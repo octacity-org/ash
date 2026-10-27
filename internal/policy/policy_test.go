@@ -37,6 +37,9 @@ func TestValidateRootsAndBounds(t *testing.T) {
 		"input bound":   {MaxInputBytes: HardMaxInputBytes + 1},
 		"output bound":  {MaxOutputBytes: HardMaxOutputBytes + 1},
 		"stream bound":  {MaxStreamBytes: -1},
+		"no port":       {ForwardTargets: []string{"localhost"}},
+		"zero port":     {ForwardTargets: []string{"localhost:0"}},
+		"empty host":    {ForwardTargets: []string{":3000"}},
 		"empty command": {AllowedCommands: []string{""}},
 	} {
 		if err := p.Validate(); err == nil {
@@ -146,5 +149,31 @@ func TestBounds(t *testing.T) {
 	}
 	if err := p.CheckOutput(21); !errors.Is(err, ErrPermissionDenied) {
 		t.Fatal("oversized output accepted")
+	}
+}
+
+func TestForwardCapabilityAndTargets(t *testing.T) {
+	if err := (Policy{Exec: true}).Check("forward"); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("forward allowed without capability: %v", err)
+	}
+	p := Policy{Forward: true, ForwardTargets: []string{"localhost:3000", "[::1]:5432"}}
+	if err := p.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Check("forward"); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{"localhost:3000", "[::1]:5432"} {
+		if err := p.CheckForwardTarget(target); err != nil {
+			t.Fatalf("%s: %v", target, err)
+		}
+	}
+	for _, target := range []string{"127.0.0.1:3000", "localhost:3001", "db:5432"} {
+		if err := p.CheckForwardTarget(target); !errors.Is(err, ErrPermissionDenied) {
+			t.Fatalf("%s allowed: %v", target, err)
+		}
+	}
+	if err := (Policy{Forward: true}).CheckForwardTarget("anything:1"); err != nil {
+		t.Fatalf("empty forward_targets must be unconstrained: %v", err)
 	}
 }

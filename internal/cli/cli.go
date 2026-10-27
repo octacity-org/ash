@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +23,7 @@ const Usage = `Usage:
 	ash [--config PATH] exec HOST [--stdin|--stream] [--cwd PATH] [--env KEY=VALUE] [--timeout 30s] -- COMMAND...
 	ash [--config PATH] execv HOST [--stdin|--stream] [--cwd PATH] [--env KEY=VALUE] [--timeout 30s] -- PROGRAM ARG...
   ash [--config PATH] rsh [-l USER] HOST COMMAND...
+  ash [--config PATH] forward HOST LOCAL_PORT:TARGET_HOST:TARGET_PORT
   ash [--config PATH] read HOST PATH [--offset N] [--limit N]
   ash [--config PATH] write HOST PATH [--atomic] < FILE
   ash [--config PATH] stat HOST PATH
@@ -47,6 +50,8 @@ With --stdin, ASH forwards up to 64 KiB from standard input to the command.
 With --stream, standard input, output and error flow to and from the command
 without size caps, and --timeout limits how long no data may move.
 rsh streams like exec --stream with the calling convention of rsync -e.
+forward listens on 127.0.0.1:LOCAL_PORT and connects to TARGET_HOST:TARGET_PORT
+from the remote host until interrupted.
 Shell send reads stdin if INPUT is omitted. Include a newline to execute input.
 Shell read returns a terminal snapshot; pass --cursor from a previous --json read for output added since then.
 Shell wait blocks for new output or --until/--regex and never closes the shell on timeout.
@@ -119,6 +124,11 @@ func Run(ctx context.Context, args []string, s *service.Service, shells *service
 			return fail(err)
 		}
 		return runStream(ctx, s, req, in, out, errout)
+	case "forward":
+		if err := runForward(ctx, args[1:], s, errout); err != nil {
+			return fail(err)
+		}
+		return 0
 	case "read":
 		if err := runRead(ctx, args[1:], s, out); err != nil {
 			return fail(err)
@@ -230,6 +240,21 @@ func parseRsh(args []string, s *service.Service) (transport.ExecRequest, error) 
 		}
 	}
 	return req, nil
+}
+
+// runForward forwards a loopback port until ctx ends.
+func runForward(ctx context.Context, args []string, s *service.Service, errout io.Writer) error {
+	if len(args) != 2 {
+		return fmt.Errorf("forward requires HOST LOCAL_PORT:TARGET_HOST:TARGET_PORT")
+	}
+	port, target, ok := strings.Cut(args[1], ":")
+	local, err := strconv.Atoi(port)
+	if !ok || err != nil || local < 0 || local > 65535 {
+		return fmt.Errorf("forward requires LOCAL_PORT:TARGET_HOST:TARGET_PORT with a local port between 0 and 65535")
+	}
+	return s.Forward(ctx, args[0], local, target, func(addr net.Addr) {
+		fmt.Fprintf(errout, "ash: forwarding %s to %s on %s; press Ctrl-C to stop\n", addr, target, args[0])
+	})
 }
 
 // execArgs is a parsed exec or execv command line.

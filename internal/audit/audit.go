@@ -43,6 +43,8 @@ type Record struct {
 	BytesIn   int64 `json:"bytes_in,omitempty"`
 	BytesOut  int64 `json:"bytes_out,omitempty"`
 	Truncated bool  `json:"truncated,omitempty"`
+	// Target is the host:port a forwarded connection reached.
+	Target string `json:"target,omitempty"`
 }
 
 // Recorder appends records to one owner-only file. It is safe for concurrent

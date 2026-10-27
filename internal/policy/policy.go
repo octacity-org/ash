@@ -4,7 +4,9 @@ package policy
 import (
 	"errors"
 	"fmt"
+	"net"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -25,6 +27,10 @@ type Policy struct {
 	Exec  bool `toml:"exec" json:"exec"`
 	Read  bool `toml:"read" json:"read"`
 	Write bool `toml:"write" json:"write"`
+	// Forward allows local port forwarding through the host. ForwardTargets
+	// restricts it to exact host:port targets; empty means unconstrained.
+	Forward        bool     `toml:"forward,omitempty" json:"forward,omitempty"`
+	ForwardTargets []string `toml:"forward_targets,omitempty" json:"forward_targets,omitempty"`
 
 	// Remote absolute POSIX roots. Empty means unconstrained.
 	ReadRoots  []string `toml:"read_roots,omitempty" json:"read_roots,omitempty"`
@@ -53,6 +59,8 @@ func (p Policy) Check(operation string) error {
 		allowed = p.Read
 	case "write":
 		allowed = p.Write
+	case "forward":
+		allowed = p.Forward
 	}
 	if !allowed {
 		return ErrPermissionDenied
@@ -102,6 +110,33 @@ func (p Policy) CheckExecutable(program string) error {
 		}
 	}
 	return fmt.Errorf("%w: executable %q is not allowed", ErrPermissionDenied, base)
+}
+
+// CheckForwardTarget verifies a host:port target against forward_targets. The
+// comparison is exact, so "localhost:3000" does not allow "127.0.0.1:3000".
+func (p Policy) CheckForwardTarget(target string) error {
+	if len(p.ForwardTargets) == 0 {
+		return nil
+	}
+	for _, allowed := range p.ForwardTargets {
+		if target == allowed {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: forward target %q is not allowed", ErrPermissionDenied, target)
+}
+
+// ValidateForwardTarget checks that target is a host:port pair with a port
+// between 1 and 65535.
+func ValidateForwardTarget(target string) error {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil || host == "" || strings.ContainsRune(target, 0) {
+		return fmt.Errorf("forward target %q must be HOST:PORT", target)
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("forward target %q needs a port between 1 and 65535", target)
+	}
+	return nil
 }
 
 // HasRoots reports whether a path root constraint applies to this direction.
@@ -179,6 +214,11 @@ func (p Policy) Validate() error {
 	}
 	if p.MaxStreamBytes < 0 {
 		return fmt.Errorf("max_stream_bytes must not be negative")
+	}
+	for _, target := range p.ForwardTargets {
+		if err := ValidateForwardTarget(target); err != nil {
+			return fmt.Errorf("forward_targets: %w", err)
+		}
 	}
 	return nil
 }

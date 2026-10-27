@@ -98,9 +98,11 @@ max_timeout_seconds = 30
 max_input_bytes = 65536
 max_output_bytes = 1048576
 max_stream_bytes = 10737418240 # cap for one streamed exec or CLI read/write; 0 or unset = unlimited
+# forward = true
+# forward_targets = ["localhost:5432"] # exact HOST:PORT targets `ash forward` may reach; empty = any
 ```
 
-Roots are **remote absolute POSIX paths**. Empty fields preserve the previous broad behavior. Paths are canonicalized through SFTP (`realpath` of the target, or of the nearest existing parent for a create) and enforced component-wise before the operation, so symlink escapes are rejected. `allowed_commands` restricts argv execution only; shell code can invoke anything, so when it is set ASH refuses shell-code `exec` and persistent shells unless `allow_shell = true`, which explicitly bypasses executable restrictions. Persistent shells also honor `cwd_roots` for their starting directory, `max_input_bytes` for each send, and `max_timeout_seconds` as a cap on `wait`. Timeout, input, and output bounds allow a request to choose *smaller* values but never larger ones, and configurable bounds may not exceed the compiled hard caps. `max_input_bytes` and `max_output_bytes` apply to buffered exec only; streamed exec (`--stream`, `rsh`) and whole-file CLI `read`/`write` are bounded by `max_stream_bytes` instead.
+Roots are **remote absolute POSIX paths**. Empty fields preserve the previous broad behavior. Paths are canonicalized through SFTP (`realpath` of the target, or of the nearest existing parent for a create) and enforced component-wise before the operation, so symlink escapes are rejected. `allowed_commands` restricts argv execution only; shell code can invoke anything, so when it is set ASH refuses shell-code `exec` and persistent shells unless `allow_shell = true`, which explicitly bypasses executable restrictions. Persistent shells also honor `cwd_roots` for their starting directory, `max_input_bytes` for each send, and `max_timeout_seconds` as a cap on `wait`. Timeout, input, and output bounds allow a request to choose *smaller* values but never larger ones, and configurable bounds may not exceed the compiled hard caps. `max_input_bytes` and `max_output_bytes` apply to buffered exec only; streamed exec (`--stream`, `rsh`) and whole-file CLI `read`/`write` are bounded by `max_stream_bytes` instead. `forward` is a separate capability, off by default, and `forward_targets` limits it to exact `HOST:PORT` strings as seen from the remote host.
 
 Set a top-level `audit_log` to append structured, local JSONL records of operations:
 
@@ -125,6 +127,7 @@ Each record contains the time, operation, ASH host, policy decision, duration, r
 printf '{"ok":true}' | ./ash exec example --stdin -- elephant receive
 tar cf - -C ./site . | ./ash exec example --stream -- tar xf - -C /srv/site
 rsync -a -e './ash rsh' ./site/ example:/srv/site/
+./ash forward example 5432:localhost:5432
 ./ash read example /etc/os-release
 ./ash read example /var/log/syslog --offset -65536
 printf 'hello from ASH\n' | ./ash write example /tmp/ash-test.txt
@@ -161,6 +164,8 @@ Pass `--stdin` to forward standard input to the remote command, avoiding shell-q
 Pass `--stream` to `exec` or `execv` to connect standard input, output and error directly to the remote command, like `ssh host command`. Nothing is buffered, so the 64 KiB input and 8 MiB output caps do not apply; this is the way to pipe archives, dumps or logs through ASH. With `--stream`, `--timeout` limits how long no data may move in either direction (default five minutes, capped by `max_timeout_seconds`), so a long transfer that keeps moving data is not cut off. `max_stream_bytes` caps the total bytes one streamed command may move. Policy checks are the same as for buffered exec, and the audit log records the bytes that actually moved. No pseudo-terminal is allocated; use persistent shells for interactive programs.
 
 `rsh [-l USER] HOST COMMAND...` is the same streamed exec with the calling convention of `rsh`, so rsync can use ASH as its remote shell: `rsync -a -e 'ash rsh' SRC host:DEST`. The command words are joined with spaces and run by the remote shell, as with `ssh`, which means `allowed_commands` refuses it unless `allow_shell = true`. `-l` must match the host's configured user, because ASH only connects as that user. OpenSSH options such as `-o` are not accepted, so `rsh` does not replace `GIT_SSH_COMMAND`.
+
+`forward HOST LOCAL_PORT:TARGET_HOST:TARGET_PORT` forwards a local port through the host, like `ssh -L`, until you press Ctrl-C. It listens on `127.0.0.1` only; `LOCAL_PORT` `0` picks a free port, which ASH prints. The target is resolved and dialed by the remote SSH server, so `localhost` means the remote machine. The host needs the `forward` capability, the target must appear in `forward_targets` when that list is set, and the server must allow TCP forwarding (`AllowTcpForwarding`, on by default in OpenSSH). All connections share one SSH connection; if it drops, connections fail until you restart the command. Each forwarded connection is audited with its target and byte counts.
 
 Commands default to a five-minute timeout. File operations default to 30 seconds. Cancellation closes the SSH connection/session; it does not guarantee termination of detached remote descendants. Verified SSH connections are pooled, and a pooled connection keeps one SFTP session open for consecutive file operations.
 
@@ -243,7 +248,7 @@ Client configuration formats vary. ASH serves only stdio; stdout is reserved for
 
 | Tool | Inputs | Result |
 | --- | --- | --- |
-| `ash_hosts` | `{}` | Public host metadata, capabilities, `shell_backend`, and any policy limits (`read_roots`, `write_roots`, `cwd_roots`, `allowed_commands`, `allow_shell`, `max_timeout_seconds`, `max_input_bytes`, `max_output_bytes`, `max_stream_bytes`) |
+| `ash_hosts` | `{}` | Public host metadata, capabilities, `shell_backend`, and any policy limits (`read_roots`, `write_roots`, `cwd_roots`, `allowed_commands`, `allow_shell`, `max_timeout_seconds`, `max_input_bytes`, `max_output_bytes`, `max_stream_bytes`, `forward_targets`) |
 | `ash_exec` | `host`, `command` **or** `argv`; optional `cwd`, `env`, `timeout_ms`, `stdin`, `stdin_base64` | `exit_code`, `stdout`, `stderr`, truncation flags, `duration_ms` |
 | `ash_read` | `host`, `path`; optional `encoding` (`text`/`base64`), `offset`, `limit` | `content` or `content_base64`, and byte `size`; slice reads add `offset` and `file_size` |
 | `ash_write` | `host`, `path`, `content` or `content_base64` | Written byte `size` |
@@ -264,7 +269,7 @@ Client configuration formats vary. ASH serves only stdio; stdout is reserved for
 
 `ash_exec` accepts standard input as UTF-8 `stdin` or base64 `stdin_base64` (mutually exclusive, at most 64 KiB); set either to an empty value to send empty input. A non-zero remote process exit is a successful MCP tool result. Connection, authentication, trust, policy and timeout failures are tool errors. `ash_read` returns UTF-8 `content` by default and rejects invalid UTF-8; pass `encoding: "base64"` for binary files. Setting `offset` or `limit` reads a slice of a file of any size (negative `offset` tails it); text slices drop a partial UTF-8 character at either edge and report the adjusted `offset`, so the next slice can start at `offset + size`. `ash_write` and `ash_write_atomic` accept `content` or `content_base64`, but not both. Host listings omit identity paths and authentication internals.
 
-Capabilities grant access with the remote account's permissions. A bare boolean `exec`/`read`/`write` does not constrain paths or commands, and an enabled `exec` capability can itself read or modify files. Optional policy fields (`read_roots`, `write_roots`, `cwd_roots`, `allowed_commands`, `allow_shell`, bound settings) add enforcement; configure only hosts and accounts you intend the connected agent to operate.
+Capabilities grant access with the remote account's permissions. A bare boolean `exec`/`read`/`write`/`forward` does not constrain paths, commands or targets, and an enabled `exec` capability can itself read or modify files. Optional policy fields (`read_roots`, `write_roots`, `cwd_roots`, `allowed_commands`, `allow_shell`, `forward_targets`, bound settings) add enforcement; configure only hosts and accounts you intend the connected agent to operate.
 
 ## Architecture
 

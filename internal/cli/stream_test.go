@@ -87,3 +87,20 @@ func TestRshRejectsOtherUserAndMissingCommand(t *testing.T) {
 		t.Fatalf("refused rsh reached transport %d times", r.calls)
 	}
 }
+
+func TestForwardRejectsBadArguments(t *testing.T) {
+	s := service.New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true}}}), new(streamRecorder))
+	for _, args := range [][]string{
+		{"forward", "h"},
+		{"forward", "h", "8080"},
+		{"forward", "h", "x:localhost:3000"},
+		{"forward", "h", "70000:localhost:3000"},
+		{"forward", "h", "8080:localhost"},
+		{"forward", "h", "8080:localhost:3000"}, // forward capability is off
+	} {
+		var out, errout bytes.Buffer
+		if code := Run(context.Background(), args, s, nil, strings.NewReader(""), &out, &errout); code != 1 || errout.Len() == 0 {
+			t.Fatalf("%v: exit %d %q", args, code, errout.String())
+		}
+	}
+}
