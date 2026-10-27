@@ -18,6 +18,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -215,6 +216,40 @@ func TestOpenSSH(t *testing.T) {
 		_, e := tr.Exec(ctx, h, transport.ExecRequest{Command: "sleep 10"})
 		if !errors.Is(e, context.Canceled) {
 			t.Fatal(e)
+		}
+	})
+	t.Run("forward", func(t *testing.T) {
+		echo, e := net.Listen("tcp", "127.0.0.1:0")
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer echo.Close()
+		go func() {
+			for {
+				c, e := echo.Accept()
+				if e != nil {
+					return
+				}
+				go func() { io.Copy(c, c); c.Close() }()
+			}
+		}()
+		forwarder, e := tr.Forward(context.Background(), h)
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer forwarder.Close()
+		for i := 0; i < 2; i++ {
+			c, e := forwarder.Dial(context.Background(), echo.Addr().String())
+			if e != nil {
+				t.Fatal(e)
+			}
+			c.Write([]byte("through sshd"))
+			c.(interface{ CloseWrite() error }).CloseWrite()
+			reply, e := io.ReadAll(c)
+			c.Close()
+			if e != nil || string(reply) != "through sshd" {
+				t.Fatalf("connection %d: %q %v", i, reply, e)
+			}
 		}
 	})
 	t.Run("stream", func(t *testing.T) {

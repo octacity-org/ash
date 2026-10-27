@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"time"
 )
@@ -62,6 +63,15 @@ type Stdio struct {
 	Stdout, Stderr io.Writer
 }
 
+// Forwarder opens TCP connections from a remote host over one SSH connection.
+type Forwarder interface {
+	// Dial connects to a host:port target as seen from the remote host.
+	Dial(ctx context.Context, address string) (net.Conn, error)
+	// Close releases the SSH connection. Connections already dialed may
+	// stop working.
+	Close() error
+}
+
 type FileInfo struct {
 	Path    string    `json:"path"`
 	Size    int64     `json:"size"`
@@ -107,6 +117,8 @@ type Transport interface {
 	// instead of buffers. Stdin and output limits in the request are ignored;
 	// the result carries only the exit code and duration.
 	ExecStream(context.Context, host.Host, ExecRequest, Stdio) (ExecResult, error)
+	// Forward holds one verified SSH connection for a forwarding session.
+	Forward(context.Context, host.Host) (Forwarder, error)
 	Read(context.Context, host.Host, string) ([]byte, error)
 	// ReadRange reads at most limit bytes starting at offset; a negative
 	// offset counts back from the end of the file.
