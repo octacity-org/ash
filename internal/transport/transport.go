@@ -5,6 +5,7 @@ import (
 	"ash/internal/host"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"time"
 )
@@ -53,6 +54,14 @@ type ExecResult struct {
 	StdoutTruncated, StderrTruncated bool
 	Duration                         time.Duration
 }
+
+// Stdio connects a streamed command to caller-owned streams. A nil Stdin
+// leaves the remote standard input open without data.
+type Stdio struct {
+	Stdin          io.Reader
+	Stdout, Stderr io.Writer
+}
+
 type FileInfo struct {
 	Path    string    `json:"path"`
 	Size    int64     `json:"size"`
@@ -94,6 +103,10 @@ type FileRange struct {
 
 type Transport interface {
 	Exec(context.Context, host.Host, ExecRequest) (ExecResult, error)
+	// ExecStream runs a command with its standard streams connected to stdio
+	// instead of buffers. Stdin and output limits in the request are ignored;
+	// the result carries only the exit code and duration.
+	ExecStream(context.Context, host.Host, ExecRequest, Stdio) (ExecResult, error)
 	Read(context.Context, host.Host, string) ([]byte, error)
 	// ReadRange reads at most limit bytes starting at offset; a negative
 	// offset counts back from the end of the file.

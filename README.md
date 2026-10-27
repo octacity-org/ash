@@ -97,9 +97,10 @@ allowed_commands = ["systemctl", "cat"]
 max_timeout_seconds = 30
 max_input_bytes = 65536
 max_output_bytes = 1048576
+max_stream_bytes = 10737418240 # cap for one streamed exec, both directions; 0 or unset = unlimited
 ```
 
-Roots are **remote absolute POSIX paths**. Empty fields preserve the previous broad behavior. Paths are canonicalized through SFTP (`realpath` of the target, or of the nearest existing parent for a create) and enforced component-wise before the operation, so symlink escapes are rejected. `allowed_commands` restricts argv execution only; shell code can invoke anything, so when it is set ASH refuses shell-code `exec` and persistent shells unless `allow_shell = true`, which explicitly bypasses executable restrictions. Persistent shells also honor `cwd_roots` for their starting directory, `max_input_bytes` for each send, and `max_timeout_seconds` as a cap on `wait`. Timeout, input, and output bounds allow a request to choose *smaller* values but never larger ones, and configurable bounds may not exceed the compiled hard caps.
+Roots are **remote absolute POSIX paths**. Empty fields preserve the previous broad behavior. Paths are canonicalized through SFTP (`realpath` of the target, or of the nearest existing parent for a create) and enforced component-wise before the operation, so symlink escapes are rejected. `allowed_commands` restricts argv execution only; shell code can invoke anything, so when it is set ASH refuses shell-code `exec` and persistent shells unless `allow_shell = true`, which explicitly bypasses executable restrictions. Persistent shells also honor `cwd_roots` for their starting directory, `max_input_bytes` for each send, and `max_timeout_seconds` as a cap on `wait`. Timeout, input, and output bounds allow a request to choose *smaller* values but never larger ones, and configurable bounds may not exceed the compiled hard caps. `max_input_bytes` and `max_output_bytes` apply to buffered exec only; streamed exec (`--stream`, `rsh`) is bounded by `max_stream_bytes` instead.
 
 Set a top-level `audit_log` to append structured, local JSONL records of operations:
 
@@ -122,6 +123,8 @@ Each record contains the time, operation, ASH host, policy decision, duration, r
 ./ash exec example --cwd '~/projects/app' --env CI=true --timeout 30s -- go test ./...
 ./ash execv example -- systemctl is-active nginx
 printf '{"ok":true}' | ./ash exec example --stdin -- elephant receive
+tar cf - -C ./site . | ./ash exec example --stream -- tar xf - -C /srv/site
+rsync -a -e './ash rsh' ./site/ example:/srv/site/
 ./ash read example /etc/os-release
 ./ash read example /var/log/syslog --offset -65536
 printf 'hello from ASH\n' | ./ash write example /tmp/ash-test.txt
@@ -154,6 +157,10 @@ Command stdout and stderr stay separate, and the CLI returns the remote process 
 `doctor` validates configuration and SSH trust without connecting when no host is named. For a host it reports configuration, host resolution, policy, known-hosts, host-key trust, authentication, POSIX shell availability, remote cache permissions, and availability of the host's shell backend (Zellij or tmux) as separate checks, each with an actionable hint, and exits non-zero when a check fails. It never prints identity paths, key material, or environment secrets. Pass `--json` for stable structured output.
 
 Pass `--stdin` to forward standard input to the remote command, avoiding shell-quoting and command-size limits. Input is bounded at 64 KiB and fails clearly when exceeded. Without `--stdin`, ASH neither reads nor forwards standard input.
+
+Pass `--stream` to `exec` or `execv` to connect standard input, output and error directly to the remote command, like `ssh host command`. Nothing is buffered, so the 64 KiB input and 8 MiB output caps do not apply; this is the way to pipe archives, dumps or logs through ASH. With `--stream`, `--timeout` limits how long no data may move in either direction (default five minutes, capped by `max_timeout_seconds`), so a long transfer that keeps moving data is not cut off. `max_stream_bytes` caps the total bytes one streamed command may move. Policy checks are the same as for buffered exec, and the audit log records the bytes that actually moved. No pseudo-terminal is allocated; use persistent shells for interactive programs.
+
+`rsh [-l USER] HOST COMMAND...` is the same streamed exec with the calling convention of `rsh`, so rsync can use ASH as its remote shell: `rsync -a -e 'ash rsh' SRC host:DEST`. The command words are joined with spaces and run by the remote shell, as with `ssh`, which means `allowed_commands` refuses it unless `allow_shell = true`. `-l` must match the host's configured user, because ASH only connects as that user. OpenSSH options such as `-o` are not accepted, so `rsh` does not replace `GIT_SSH_COMMAND`.
 
 Commands default to a five-minute timeout. File operations default to 30 seconds. Cancellation closes the SSH connection/session; it does not guarantee termination of detached remote descendants. Verified SSH connections are pooled, and a pooled connection keeps one SFTP session open for consecutive file operations.
 
@@ -236,7 +243,7 @@ Client configuration formats vary. ASH serves only stdio; stdout is reserved for
 
 | Tool | Inputs | Result |
 | --- | --- | --- |
-| `ash_hosts` | `{}` | Public host metadata, capabilities, `shell_backend`, and any policy limits (`read_roots`, `write_roots`, `cwd_roots`, `allowed_commands`, `allow_shell`, `max_timeout_seconds`, `max_input_bytes`, `max_output_bytes`) |
+| `ash_hosts` | `{}` | Public host metadata, capabilities, `shell_backend`, and any policy limits (`read_roots`, `write_roots`, `cwd_roots`, `allowed_commands`, `allow_shell`, `max_timeout_seconds`, `max_input_bytes`, `max_output_bytes`, `max_stream_bytes`) |
 | `ash_exec` | `host`, `command` **or** `argv`; optional `cwd`, `env`, `timeout_ms`, `stdin`, `stdin_base64` | `exit_code`, `stdout`, `stderr`, truncation flags, `duration_ms` |
 | `ash_read` | `host`, `path`; optional `encoding` (`text`/`base64`), `offset`, `limit` | `content` or `content_base64`, and byte `size`; slice reads add `offset` and `file_size` |
 | `ash_write` | `host`, `path`, `content` or `content_base64` | Written byte `size` |

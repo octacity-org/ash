@@ -216,6 +216,42 @@ func TestOpenSSH(t *testing.T) {
 			t.Fatal(e)
 		}
 	})
+	t.Run("stream", func(t *testing.T) {
+		ash, config := buildCLI(t, dir, address, port, current.Username, identity, serverKey)
+		src := filepath.Join(dir, "stream-src")
+		os.MkdirAll(filepath.Join(src, "bin"), 0755)
+		os.WriteFile(filepath.Join(src, "bin", "run.sh"), []byte("#!/bin/sh\n"), 0755)
+		os.WriteFile(filepath.Join(src, "secret"), []byte("key"), 0600)
+		os.WriteFile(filepath.Join(src, "big"), make([]byte, transport.MaxOutputSize+1), 0644)
+		dest := filepath.Join(dir, "stream-dest")
+		os.MkdirAll(dest, 0755)
+		pipeline := fmt.Sprintf("tar cf - -C %s . | %s --config %s exec fixture --stream -- tar xf - -C %s", src, ash, config, dest)
+		if output, e := exec.Command("sh", "-c", pipeline).CombinedOutput(); e != nil {
+			t.Fatalf("%v: %s", e, output)
+		}
+		for name, mode := range map[string]os.FileMode{"bin/run.sh": 0755, "secret": 0600, "big": 0644} {
+			info, e := os.Stat(filepath.Join(dest, name))
+			if e != nil || info.Mode().Perm() != mode {
+				t.Fatalf("%s: %v %v", name, info, e)
+			}
+		}
+		code := exec.Command(ash, "--config", config, "exec", "fixture", "--stream", "--", "exit 5")
+		if e := code.Run(); code.ProcessState.ExitCode() != 5 {
+			t.Fatalf("exit code %d: %v", code.ProcessState.ExitCode(), e)
+		}
+		rsync, e := exec.LookPath("rsync")
+		if e != nil {
+			t.Skip("rsync is not installed")
+		}
+		mirror := filepath.Join(dir, "rsync-dest")
+		sync := exec.Command(rsync, "-a", "-e", ash+" --config "+config+" rsh", src+"/", "fixture:"+mirror+"/")
+		if output, e := sync.CombinedOutput(); e != nil {
+			t.Fatalf("rsync: %v: %s", e, output)
+		}
+		if info, e := os.Stat(filepath.Join(mirror, "bin", "run.sh")); e != nil || info.Mode().Perm() != 0755 {
+			t.Fatalf("rsync result: %v %v", info, e)
+		}
+	})
 	t.Run("unknown host", func(t *testing.T) {
 		empty := filepath.Join(dir, "empty_known_hosts")
 		os.WriteFile(empty, nil, 0600)
@@ -369,4 +405,25 @@ func TestOpenSSH(t *testing.T) {
 			t.Fatalf("identity fallback: %+v %v", r, e)
 		}
 	})
+}
+
+// buildCLI builds the ash binary and writes a configuration and known_hosts
+// file for the fixture, returning the binary and configuration paths. HOME
+// points at dir so the CLI reads the fixture's known_hosts.
+func buildCLI(t *testing.T, dir, address string, port int, username, identity string, serverKey ssh.PublicKey) (string, string) {
+	t.Helper()
+	ash := filepath.Join(dir, "ash")
+	if output, err := exec.Command("go", "build", "-o", ash, "../cmd/ash").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v: %s", err, output)
+	}
+	sshDir := filepath.Join(dir, ".ssh")
+	os.MkdirAll(sshDir, 0700)
+	os.WriteFile(filepath.Join(sshDir, "known_hosts"), []byte(knownhosts.Line([]string{address}, serverKey)+"\n"), 0600)
+	t.Setenv("HOME", dir)
+	config := filepath.Join(dir, "ash.toml")
+	body := fmt.Sprintf("[hosts.fixture]\naddress = \"127.0.0.1\"\nport = %d\nuser = %q\nidentity = %q\n\n[hosts.fixture.policy]\nexec = true\n", port, username, identity)
+	if err := os.WriteFile(config, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return ash, config
 }

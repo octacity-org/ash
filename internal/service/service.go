@@ -46,6 +46,7 @@ type HostInfo struct {
 	MaxTimeoutSeconds int      `json:"max_timeout_seconds,omitempty"`
 	MaxInputBytes     int64    `json:"max_input_bytes,omitempty"`
 	MaxOutputBytes    int64    `json:"max_output_bytes,omitempty"`
+	MaxStreamBytes    int64    `json:"max_stream_bytes,omitempty"`
 }
 
 func (s *Service) Hosts() []HostInfo {
@@ -67,6 +68,7 @@ func (s *Service) Hosts() []HostInfo {
 			ReadRoots: p.ReadRoots, WriteRoots: p.WriteRoots, CwdRoots: p.CwdRoots,
 			AllowedCommands: p.AllowedCommands, AllowShell: p.AllowShell,
 			MaxTimeoutSeconds: p.MaxTimeoutSeconds, MaxInputBytes: p.MaxInputBytes, MaxOutputBytes: p.MaxOutputBytes,
+			MaxStreamBytes: p.MaxStreamBytes,
 		})
 	}
 	return out
@@ -167,24 +169,62 @@ func (s *Service) Exec(ctx context.Context, req transport.ExecRequest) (transpor
 	return result, err
 }
 
-func (s *Service) exec(ctx context.Context, h host.Host, req transport.ExecRequest) (transport.ExecResult, error) {
-	name := req.Host
+// checkCommand enforces the command shape and the executable policy shared by
+// buffered and streamed exec.
+func checkCommand(h host.Host, req transport.ExecRequest) error {
 	argv := len(req.Argv) > 0
 	switch {
 	case argv && req.Command != "":
-		return transport.ExecResult{}, fmt.Errorf("command and argv are mutually exclusive")
+		return fmt.Errorf("command and argv are mutually exclusive")
 	case !argv && req.Command == "":
-		return transport.ExecResult{}, fmt.Errorf("command must not be empty")
+		return fmt.Errorf("command must not be empty")
 	}
 	if argv {
 		if req.Argv[0] == "" {
-			return transport.ExecResult{}, fmt.Errorf("argv program must not be empty")
+			return fmt.Errorf("argv program must not be empty")
 		}
 		if err := h.Policy.CheckExecutable(req.Argv[0]); err != nil {
-			return transport.ExecResult{}, fmt.Errorf("host %q: exec: %w", name, err)
+			return fmt.Errorf("host %q: exec: %w", req.Host, err)
 		}
 	} else if err := h.Policy.CheckShell(); err != nil {
-		return transport.ExecResult{}, fmt.Errorf("host %q: exec: %w", name, err)
+		return fmt.Errorf("host %q: exec: %w", req.Host, err)
+	}
+	return nil
+}
+
+// execTimeout applies the default and the policy cap to a requested timeout.
+func execTimeout(h host.Host, timeout time.Duration) (time.Duration, error) {
+	if timeout < 0 {
+		return 0, fmt.Errorf("timeout must be positive")
+	}
+	if timeout == 0 {
+		timeout = transport.DefaultExecTimeout
+	}
+	if limit := h.Policy.MaxTimeout(); limit > 0 && timeout > limit {
+		timeout = limit
+	}
+	return timeout, nil
+}
+
+// checkCwd enforces cwd roots against the canonical working directory.
+func (s *Service) checkCwd(ctx context.Context, h host.Host, req transport.ExecRequest) error {
+	if req.Cwd == "" || len(h.Policy.CwdRoots) == 0 {
+		return nil
+	}
+	canonical, err := s.transport.Canonicalize(ctx, h, req.Cwd)
+	if err != nil {
+		return operationError(ctx, req.Host, "exec", err)
+	}
+	if err := h.Policy.CheckCwd(canonical); err != nil {
+		return fmt.Errorf("host %q: exec: %w", req.Host, err)
+	}
+	return nil
+}
+
+func (s *Service) exec(ctx context.Context, h host.Host, req transport.ExecRequest) (transport.ExecResult, error) {
+	name := req.Host
+	if err := checkCommand(h, req); err != nil {
+		return transport.ExecResult{}, err
 	}
 	if len(req.Stdin) > transport.MaxExecInputSize {
 		return transport.ExecResult{}, fmt.Errorf("exec input exceeds %d byte limit", transport.MaxExecInputSize)
@@ -192,31 +232,21 @@ func (s *Service) exec(ctx context.Context, h host.Host, req transport.ExecReque
 	if err := h.Policy.CheckInput(len(req.Stdin)); err != nil {
 		return transport.ExecResult{}, fmt.Errorf("host %q: exec: %w", name, err)
 	}
-	if req.Timeout < 0 {
-		return transport.ExecResult{}, fmt.Errorf("timeout must be positive")
+	timeout, err := execTimeout(h, req.Timeout)
+	if err != nil {
+		return transport.ExecResult{}, err
 	}
+	req.Timeout = timeout
 	if h.Policy.MaxOutputBytes > 0 {
 		req.MaxOutput = int(h.Policy.MaxOutputBytes)
-	}
-	if req.Timeout == 0 {
-		req.Timeout = transport.DefaultExecTimeout
-	}
-	if limit := h.Policy.MaxTimeout(); limit > 0 && req.Timeout > limit {
-		req.Timeout = limit
 	}
 	ctx, cancel := context.WithTimeout(ctx, req.Timeout)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return transport.ExecResult{}, operationError(ctx, name, "exec", err)
 	}
-	if req.Cwd != "" && len(h.Policy.CwdRoots) > 0 {
-		canonical, err := s.transport.Canonicalize(ctx, h, req.Cwd)
-		if err != nil {
-			return transport.ExecResult{}, operationError(ctx, name, "exec", err)
-		}
-		if err := h.Policy.CheckCwd(canonical); err != nil {
-			return transport.ExecResult{}, fmt.Errorf("host %q: exec: %w", name, err)
-		}
+	if err := s.checkCwd(ctx, h, req); err != nil {
+		return transport.ExecResult{}, err
 	}
 	result, err := s.transport.Exec(ctx, h, req)
 	return result, operationError(ctx, name, "exec", err)
