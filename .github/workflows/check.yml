@@ -45,7 +45,6 @@ jobs:
       run: uvx --from omniship==0.6.0 omniship run-node --stage check --node build-and-test --config omniship.yaml
       env:
         CGO_ENABLED: '1'
-        CC: ${{ matrix.cc }}
         EXPECTED_GOOS: ${{ matrix.goos }}
         EXPECTED_GOARCH: ${{ matrix.goarch }}
         OMNISHIP_REF_TYPE: ${{ github.ref_type }}
@@ -63,22 +62,18 @@ jobs:
           target: linux-arm64
           goos: linux
           goarch: arm64
-          cc: gcc
         - runner: ubuntu-24.04
           target: linux-amd64
           goos: linux
           goarch: amd64
-          cc: gcc
         - runner: windows-2022
           target: windows-amd64
           goos: windows
           goarch: amd64
-          cc: gcc
         - runner: macos-15
           target: macos-arm64
           goos: darwin
           goarch: arm64
-          cc: clang
   check-complete:
     name: Check complete
     needs: check-build-and-test
