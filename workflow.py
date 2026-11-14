@@ -47,9 +47,13 @@ github = GitHubActions(
             "jobs.check-build-and-test.name": "Build and test (${{ matrix.target }})"
         },
     ),
-    # Build runs only as part of Ship.
+    # Ship runs Build on a pushed tag. A manual run on a tag builds the
+    # release archives without publishing them.
     build=GitHubWorkflow(
-        file="build.yml", name="Build", triggers=[], cancel_superseded=True
+        file="build.yml",
+        name="Build",
+        triggers=[GitHubWorkflowDispatch()],
+        cancel_superseded=True,
     ),
     ship=GitHubWorkflow(
         file="ship.yml",
@@ -67,18 +71,16 @@ RUNNERS = [
     GitHubRunner.WINDOWS_2022,
     GitHubRunner.MACOS_15,
 ]
-# CC is each platform's default compiler; Windows needs it set explicitly for
-# race tests.
 PLATFORMS = GitHubMatrix(
     include=[
         {"runner": "ubuntu-24.04-arm", "target": "linux-arm64",
-         "goos": "linux", "goarch": "arm64", "cc": "gcc"},
+         "goos": "linux", "goarch": "arm64"},
         {"runner": "ubuntu-24.04", "target": "linux-amd64",
-         "goos": "linux", "goarch": "amd64", "cc": "gcc"},
+         "goos": "linux", "goarch": "amd64"},
         {"runner": "windows-2022", "target": "windows-amd64",
-         "goos": "windows", "goarch": "amd64", "cc": "gcc"},
+         "goos": "windows", "goarch": "amd64"},
         {"runner": "macos-15", "target": "macos-arm64",
-         "goos": "darwin", "goarch": "arm64", "cc": "clang"},
+         "goos": "darwin", "goarch": "arm64"},
     ]
 )  # fmt: skip
 GO = GoToolchain(version_file="go.mod", cache=True)
@@ -101,7 +103,7 @@ def platform_job(
         runners=RUNNERS,
         matrix=PLATFORMS,
         timeout_minutes=30,
-        env={"CGO_ENABLED": "1", "CC": github.matrix("cc"), **(env or {})},
+        env={"CGO_ENABLED": "1", **(env or {})},
         before_steps=[SETUP_PYTHON] if python else [],
         retention_days=retention_days,
     )
@@ -120,8 +122,21 @@ def python(ctx) -> str:
     return shutil.which("python", path=ctx.env.get("PATH")) or sys.executable
 
 
+def is_tag_run(ctx) -> bool:
+    return ctx.env.get("GITHUB_REF_TYPE") == "tag"
+
+
+def select_windows_compiler(ctx) -> None:
+    """Use gcc for cgo on Windows, as the race tests need; other hosts keep
+    their default compiler. Later commands in the task inherit ctx.env."""
+
+    if ctx.host.os == OperatingSystem.WINDOWS:
+        ctx.env["CC"] = "gcc"
+        Shell(ctx).run("gcc", "--version")
+
+
 def release_tag(ctx) -> str:
-    if ctx.env.get("GITHUB_REF_TYPE") != "tag":
+    if not is_tag_run(ctx):
         ctx.fail("Release steps run only for a pushed tag")
     return ctx.env["GITHUB_REF_NAME"]
 
@@ -129,7 +144,7 @@ def release_tag(ctx) -> str:
 def release_version(ctx) -> str:
     """The version stamped into the binary: the tag's, or dev-<commit>."""
 
-    if ctx.env.get("GITHUB_REF_TYPE") == "tag":
+    if is_tag_run(ctx):
         output = Shell(ctx).run(
             python(ctx), "scripts/release.py", "version", ctx.env["GITHUB_REF_NAME"]
         )
@@ -194,10 +209,15 @@ def check(stage):
             python(ctx), "-m", "unittest", "discover",
             "-s", "scripts", "-p", "test_*.py", "-v",
         )  # fmt: skip
+        select_windows_compiler(ctx)
         go.test(timeout="5m", verbose=True)
         go.test(race=True, timeout="5m")
         go.vet()
-        build_executable(ctx, version)
+        if is_tag_run(ctx):
+            # Build's package task builds and smoke-tests the release binary.
+            ctx.log.info("Tag run: the smoke build runs in Build")
+        else:
+            build_executable(ctx, version)
 
 
 @pipeline.build
@@ -214,6 +234,7 @@ def build(stage):
         """Build, smoke-test and archive one platform's executable."""
 
         tag = release_tag(ctx)
+        select_windows_compiler(ctx)
         binary = build_executable(ctx, release_version(ctx))
         shell = Shell(ctx)
         shell.run("go", "mod", "vendor", "-o", ".deps/notices")
