@@ -297,7 +297,7 @@ These opt-in tests create and clean up their own remote ASH sessions. They cover
 
 ## CI and releases
 
-[GitHub Actions](.github/workflows/ci.yml) follows Elephant's native build and release workflow. Pushes, pull requests, and manual runs check formatting, release packaging tests, Go tests (including real MCP subprocesses), race detection, and `go vet` on:
+CI and releases are defined in [`workflow.py`](workflow.py) with [OmniShip](https://github.com/octacity-org/omniship), which generates the GitHub Actions workflows in `.github/workflows/`; run `omniship generate` after changing it. Pushes, pull requests, and manual runs check formatting, release packaging tests, Go tests (including real MCP subprocesses), race detection, and `go vet` on:
 
 - Linux ARM64 (`ubuntu-24.04-arm`)
 - Linux AMD64 (`ubuntu-24.04`)
